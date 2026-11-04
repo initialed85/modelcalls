@@ -1,0 +1,3 @@
+mc-pg-data/
+/tmp/
+*.log
