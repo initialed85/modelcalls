@@ -40,6 +40,11 @@ steps:
       - for i in $(seq 1 60); do pg_isready -h postgres -U mc -d modelcalls && break; sleep 1; done
       - pg_isready -h postgres -U mc -d modelcalls
       - psql -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
+      # Both migrations, in order, because 001 alone is only the fresh-install story: its CREATE TABLE
+      # IF NOT EXISTS means an existing call_events keeps its old join_method CHECK, so a lane that runs
+      # 001 only is a lane that never tests the path a real upgrade takes.
+      - psql -v ON_ERROR_STOP=1 -f migrations/002_join_tiers.sql
+      - psql -v ON_ERROR_STOP=1 -f migrations/003_usage_semantics.sql
       - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
 
   - name: go-contract

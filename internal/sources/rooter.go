@@ -51,40 +51,45 @@ type rooterEnvelope struct {
 // theirs too: a field that is absent in JSON was either zero or never measured, and this schema
 // refuses to read that as a measurement of zero.
 type rooterRecord struct {
-	ID               string          `json:"id"`
-	UpstreamID       string          `json:"upstream_id"`
-	UpstreamCreated  int64           `json:"upstream_created"`
-	TS               string          `json:"ts"`
-	Path             string          `json:"path"`
-	Method           string          `json:"method"`
-	Kind             string          `json:"kind"`
-	Key              string          `json:"key"`
-	KeySource        string          `json:"key_source"`
-	Backend          string          `json:"backend"`
-	BackendURL       string          `json:"backend_url"`
-	Alias            string          `json:"alias"`
-	Profile          string          `json:"profile"`
-	Version          string          `json:"version"`
-	Model            string          `json:"model"`
-	ModelRequested   string          `json:"model_requested"`
-	Stream           bool            `json:"stream"`
-	Status           int             `json:"status"`
-	Bytes            int64           `json:"bytes"`
-	Aborted          bool            `json:"aborted"`
-	Error            string          `json:"error"`
-	WaitMs           float64         `json:"wait_ms"`
-	TTFTMs           float64         `json:"ttft_ms"`
-	TotalMs          float64         `json:"total_ms"`
-	PromptTokens     *int64          `json:"prompt_tokens"`
-	CompletionTokens *int64          `json:"completion_tokens"`
-	CachedTokens     *int64          `json:"cached_tokens"`
-	PrefillMs        *float64        `json:"prefill_ms"`
-	PrefillTokS      *float64        `json:"prefill_tok_s"`
-	DecodeMs         *float64        `json:"decode_ms"`
-	DecodeTokS       *float64        `json:"decode_tok_s"`
-	CacheHitRate     *float64        `json:"cache_hit_rate"`
-	FinishReason     string          `json:"finish_reason"`
-	Extra            json.RawMessage `json:"extra"`
+	ID              string  `json:"id"`
+	UpstreamID      string  `json:"upstream_id"`
+	UpstreamCreated int64   `json:"upstream_created"`
+	TS              string  `json:"ts"`
+	Path            string  `json:"path"`
+	Method          string  `json:"method"`
+	Kind            string  `json:"kind"`
+	Key             string  `json:"key"`
+	KeySource       string  `json:"key_source"`
+	Backend         string  `json:"backend"`
+	BackendURL      string  `json:"backend_url"`
+	Alias           string  `json:"alias"`
+	Profile         string  `json:"profile"`
+	Version         string  `json:"version"`
+	Model           string  `json:"model"`
+	ModelRequested  string  `json:"model_requested"`
+	Stream          bool    `json:"stream"`
+	Status          int     `json:"status"`
+	Bytes           int64   `json:"bytes"`
+	Aborted         bool    `json:"aborted"`
+	Error           string  `json:"error"`
+	WaitMs          float64 `json:"wait_ms"`
+	TTFTMs          float64 `json:"ttft_ms"`
+	TotalMs         float64 `json:"total_ms"`
+	PromptTokens    *int64  `json:"prompt_tokens"`
+	// Rooter publishes its own arithmetic answer for the prompt length next to llama.cpp's reported
+	// count, because prompt_n is not the whole prompt. Live: prompt_tokens 98060,
+	// prompt_tokens_computed 98060, extra.prompt_n 98060. It is stored as its own column and never
+	// substituted for the reported number.
+	PromptTokensComputed *int64          `json:"prompt_tokens_computed"`
+	CompletionTokens     *int64          `json:"completion_tokens"`
+	CachedTokens         *int64          `json:"cached_tokens"`
+	PrefillMs            *float64        `json:"prefill_ms"`
+	PrefillTokS          *float64        `json:"prefill_tok_s"`
+	DecodeMs             *float64        `json:"decode_ms"`
+	DecodeTokS           *float64        `json:"decode_tok_s"`
+	CacheHitRate         *float64        `json:"cache_hit_rate"`
+	FinishReason         string          `json:"finish_reason"`
+	Extra                json.RawMessage `json:"extra"`
 }
 
 // Pull reads everything after the cursor and advances it. An error leaves the cursor where it was,
@@ -187,6 +192,7 @@ func (r *Rooter) event(rec rooterRecord) store.Event {
 		ev.Extra["upstream_created"] = rec.UpstreamCreated
 	}
 	ev.PromptTokens = rec.PromptTokens
+	ev.PromptTokensComputed = rec.PromptTokensComputed
 	ev.CompletionTokens = rec.CompletionTokens
 	ev.CachedTokens = rec.CachedTokens
 	// rooter calls it prefill_ms, strata calls it prompt_ms, and the schema has one column because it
@@ -215,10 +221,12 @@ func (r *Rooter) event(rec rooterRecord) store.Event {
 			ev.Extra["raw"] = raw
 		}
 	}
-	// No UsageSource. rooter's record has no field saying which mechanism produced the token counts
-	// (it can be the client's own include_usage, or rooter injecting it for a stream that ended
-	// early), and guessing would put a false provenance on the one field this schema exists to keep
-	// honest. The column default 'none' says what is actually known: nobody said.
+	// No UsageSource. rooter's live ring records carry no provenance field at all (checked against the
+	// deployed payload: no usage_source key in any event), and rooter's own contract notes say the
+	// vocabulary it would report is 'none' or 'client' - never an injected value, because injecting
+	// include_usage turned out to be a no-op on llama.cpp: the usage tail arrives whether or not the
+	// request asked for it. Guessing here would put a false provenance on the one field this schema
+	// exists to keep honest, so the column default 'none' reports what is actually known: nobody said.
 	return ev
 }
 

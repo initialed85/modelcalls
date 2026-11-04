@@ -65,17 +65,26 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- How this row came to represent the call it represents:
 	--   self                 - the only source that saw it.
 	--   upstream_id          - joined to an existing row by the runner's chatcmpl id.
-	--   backend_key_window   - fallback join: same backend, exactly one side holding a session key,
-	--                          candidate with no upstream_id and source_count = 1, starts within the
-	--                          window (plus each side's wait_ms), and the two call intervals
-	--                          overlapping. Proximity is the discriminator: a long interval alone
-	--                          touches a lot of unrelated work, which is how a 125.6 s call absorbed
-	--                          a 4.7 s record two minutes later in a live run.
-	-- Recorded rather than inferred at query time, because the fallback join is the part of this
-	-- design that rests on an assumption, and a dashboard must be able to show how much of what
-	-- it displays depends on it.
+	--   usage_content_window - a fallback join resting on measured agreement.
+	--   backend_key_window   - a fallback join resting on timing plus a wire witness.
+	-- Recorded rather than inferred at query time, because the fallback joins are the part of this
+	-- design that rests on assumptions, and a dashboard must be able to show how much of what it
+	-- displays depends on each of them. The two fallback tiers are recorded SEPARATELY on purpose:
+	--   usage_content_window  - both sides measured prompt and completion tokens and those numbers
+	--                           agree exactly, on top of start proximity, the wire witness and
+	--                           source_count = 1. Content agreement, and the only way to reach a row
+	--                           that already carries an upstream_id - which rooter's ring records now
+	--                           supply for most calls.
+	--   backend_key_window    - same backend, exactly one side holding a session key, source_count = 1,
+	--                           starts within the window (plus each side's wait_ms) with the intervals
+	--                           overlapping as a secondary guard, and nobody has identified the
+	--                           candidate. Used where one side measured no usage at all: a clock
+	--                           agreement, which is what an abandoned stream leaves behind.
+	-- Ranking them is the difference between "I know this is one call" and "I believe it is". When both
+	-- sides measured and the numbers disagree, neither tier fires - that is a different call, and it is
+	-- 90 ms and 100 ms from being mistaken for one.
 	join_method text NOT NULL DEFAULT 'self'
-		check (join_method in ('self', 'upstream_id', 'backend_key_window')),
+		check (join_method in ('self', 'upstream_id', 'usage_content_window', 'backend_key_window')),
 
 	-- ─── envelope: what a router knows even when the model never finished ───────────────
 	--
@@ -153,11 +162,21 @@ CREATE TABLE IF NOT EXISTS call_events (
 
 	-- ─── tokens: NULL when not reported ────────────────────────────────────────────────
 	--
-	-- A streaming response with no stream_options.include_usage carries no usage at all. rooter
-	-- injects include_usage into streaming requests it forwards so the tail is parseable, which
-	-- is a request-body mutation and the one place rooter stops being transparent - so the row
-	-- records whose usage this is rather than assuming.
+	-- A streaming response with no stream_options.include_usage carries no usage at all. rooter used to
+	-- inject include_usage into streaming requests it forwarded so the tail was parseable; it now
+	-- reports that the injection is a no-op on llama.cpp (the tail arrives either way), and its API
+	-- only ever names 'none' or 'client'. Live confirms it: 56 rooter rows in this store, none of them
+	-- 'injected'. So the mechanism is recorded when a surface can state it and 'none' when it cannot -
+	-- which for rooter's ring today means 'none', because its records carry no provenance field.
 	prompt_tokens integer check (prompt_tokens is null or prompt_tokens >= 0),
+	-- prompt_tokens_computed exists because llama.cpp's `prompt_n` is not the whole prompt. rooter
+	-- publishes its own arithmetic answer beside the reported count rather than replacing it, and so
+	-- does this table: the two are separate columns, and a reader can see which calls the runner
+	-- under-reported. Collapsing them would destroy the only evidence of how often that happens.
+	-- Live from rooter's ring: prompt_tokens 98060 with prompt_tokens_computed 98060 and extra.prompt_n
+	-- 98060 - equal here, and that is a measurement, not an assumption; the columns stay apart so the
+	-- unequal cases are visible instead of averaged.
+	prompt_tokens_computed integer check (prompt_tokens_computed is null or prompt_tokens_computed >= 0),
 	completion_tokens integer check (completion_tokens is null or completion_tokens >= 0),
 
 	-- cached_tokens is the wire/usage view (what the runner billed as cached). engine_cached_tokens
@@ -223,6 +242,17 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- Whether this row may be included in an aggregate over tokens or rates. Generated, so no
 	-- writer can disagree with it.
 	has_usage boolean GENERATED ALWAYS AS (prompt_tokens is not null and completion_tokens is not null) STORED,
+	-- A rate that cannot exist. cached_tokens > prompt_tokens is not automatically a bug: llama.cpp's
+	-- prompt_n can be smaller than the cached span it reuses, so the runner's own numbers can legitimately
+	-- exceed each other. It is also exactly what a bad join produces - one surface's cached count sitting
+	-- on another surface's prompt count. The two cases look identical in the data, so this column names
+	-- the state instead of guessing which caused it, and call_quality counts it.
+	cache_rate_undefined boolean GENERATED ALWAYS AS (
+		(prompt_tokens is not null and prompt_tokens > 0 and (
+			(cached_tokens is not null and cached_tokens > prompt_tokens)
+			or (engine_cached_tokens is not null and engine_cached_tokens > prompt_tokens)
+		))
+	) STORED,
 
 	finish_reason text,
 
@@ -256,10 +286,18 @@ CREATE TABLE IF NOT EXISTS call_events (
 -- appends its own id to source_ids, and records join_method = 'upstream_id'. A runner-side event
 -- physically cannot create a second row for a call that is already in the store.
 --
--- The open assumption is that strata's requests[].id is the same chatcmpl id it returns in the
--- response body. If it is not, the join silently stops happening and routed calls appear as two
--- single-source rows with source_count 1 each - which is measurable (see call_quality), so this
--- assumption fails visibly rather than quietly double counting.
+-- The assumption this index rests on is now KNOWN to be false, and stating that here is the point:
+-- strata's requests[].id is NOT the chatcmpl id it returns in the response body. Measured twice -
+-- a response body carrying chatcmpl-9d2f3f13f80c48a8a1b99817 against the same runner's metrics
+-- record id cbace0db24184790b1111c5b9f984904, and a live harvest where the engine records were
+-- 12-hex ids like 5628878f244b while rooter's events carried chatcmpl-b434b754898a409faacc8936.
+-- So this index joins the surfaces that echo the response id (a router, a client-side recorder) and
+-- joins NOTHING to strata's own records. Routed calls therefore reach one row through the fallback,
+-- not through here - which is why the fallback is a first-class path with two named tiers rather than
+-- a curiosity, and why call_quality counts them apart.
+--
+-- What would still break quietly: if two surfaces DID share an id for different calls, this collides
+-- them into one row. The id space is a runner's, so the risk is a runner reusing an id, not us.
 CREATE UNIQUE INDEX IF NOT EXISTS call_events_upstream_key
 	ON call_events (upstream_id)
 	WHERE upstream_id is not null and upstream_id <> '';
@@ -316,16 +354,27 @@ BEGIN
 		IF NEW.cached_tokens IS NOT NULL THEN
 			wire_ratio := NEW.cached_tokens::numeric / NEW.prompt_tokens::numeric;
 			IF wire_ratio > 1 THEN
-				-- cached_tokens larger than prompt_tokens is not a rounding error, it is two surfaces
-				-- describing different calls agreeing by accident - the fallback join failing loudly.
-				RAISE EXCEPTION 'call_events: cached_tokens % exceeds prompt_tokens % on event_key % - two surfaces are describing different calls',
-					NEW.cached_tokens, NEW.prompt_tokens, NEW.event_key;
+				-- Not an exception, and that reversal is deliberate. Two ways to get here: a bad join
+				-- putting one surface's cached count on another's prompt count, or llama.cpp's prompt_n
+				-- genuinely smaller than the cached span it reused (which is why rooter publishes
+				-- prompt_tokens_computed at all). Raising here rejected the whole write - the store lost a
+				-- call a router had fully witnessed because a DERIVED ratio was undefined, and the counter
+				-- it reported was a write error rather than "one rate is unusable". The rate goes NULL,
+				-- cache_rate_undefined says so in the row, and the components stay for a recompute.
+				-- A CLAIMED rate is still refused: nothing is derivable from these components, so anyone
+				-- putting a number here brought it from somewhere else.
+				IF claimed_wire THEN
+					RAISE EXCEPTION 'call_events: cache_hit_rate % claimed on event_key % while cached_tokens % exceeds prompt_tokens % - these components support no rate, so a claim here is an expert rate in a prompt-reuse column or a join that mixed two calls',
+						NEW.cache_hit_rate, NEW.event_key, NEW.cached_tokens, NEW.prompt_tokens;
+				END IF;
+				NEW.cache_hit_rate := NULL;
+			ELSE
+				IF claimed_wire AND abs(NEW.cache_hit_rate::numeric - wire_ratio) > 0.000001 THEN
+					RAISE EXCEPTION 'call_events: cache_hit_rate % does not match cached_tokens % / prompt_tokens % = % on event_key % (this is where Strata''s expert-cache hit_rate would land, and it is not a prompt-reuse rate)',
+						NEW.cache_hit_rate, NEW.cached_tokens, NEW.prompt_tokens, wire_ratio, NEW.event_key;
+				END IF;
+				NEW.cache_hit_rate := wire_ratio;
 			END IF;
-			IF claimed_wire AND abs(NEW.cache_hit_rate::numeric - wire_ratio) > 0.000001 THEN
-				RAISE EXCEPTION 'call_events: cache_hit_rate % does not match cached_tokens % / prompt_tokens % = % on event_key % (this is where Strata''s expert-cache hit_rate would land, and it is not a prompt-reuse rate)',
-					NEW.cache_hit_rate, NEW.cached_tokens, NEW.prompt_tokens, wire_ratio, NEW.event_key;
-			END IF;
-			NEW.cache_hit_rate := wire_ratio;
 		ELSIF NEW.cache_hit_rate IS NOT NULL THEN
 			IF claimed_wire THEN
 				RAISE EXCEPTION 'call_events: cache_hit_rate % on event_key % has no cached_tokens to derive it from - a rate with no numerator is a guess wearing a column',
@@ -339,14 +388,19 @@ BEGIN
 		IF NEW.engine_cached_tokens IS NOT NULL THEN
 			engine_ratio := NEW.engine_cached_tokens::numeric / NEW.prompt_tokens::numeric;
 			IF engine_ratio > 1 THEN
-				RAISE EXCEPTION 'call_events: engine_cached_tokens % exceeds prompt_tokens % on event_key % - two surfaces are describing different calls',
-					NEW.engine_cached_tokens, NEW.prompt_tokens, NEW.event_key;
+				-- Same reasoning as the wire ratio above: the rate is undefined, the row is not invalid.
+				IF claimed_engine THEN
+					RAISE EXCEPTION 'call_events: engine_cache_hit_rate % claimed on event_key % while engine_cached_tokens % exceeds prompt_tokens % - no rate is derivable here either',
+						NEW.engine_cache_hit_rate, NEW.event_key, NEW.engine_cached_tokens, NEW.prompt_tokens;
+				END IF;
+				NEW.engine_cache_hit_rate := NULL;
+			ELSE
+				IF claimed_engine AND abs(NEW.engine_cache_hit_rate::numeric - engine_ratio) > 0.000001 THEN
+					RAISE EXCEPTION 'call_events: engine_cache_hit_rate % does not match engine_cached_tokens % / prompt_tokens % = % on event_key %',
+						NEW.engine_cache_hit_rate, NEW.engine_cached_tokens, NEW.prompt_tokens, engine_ratio, NEW.event_key;
+				END IF;
+				NEW.engine_cache_hit_rate := engine_ratio;
 			END IF;
-			IF claimed_engine AND abs(NEW.engine_cache_hit_rate::numeric - engine_ratio) > 0.000001 THEN
-				RAISE EXCEPTION 'call_events: engine_cache_hit_rate % does not match engine_cached_tokens % / prompt_tokens % = % on event_key %',
-					NEW.engine_cache_hit_rate, NEW.engine_cached_tokens, NEW.prompt_tokens, engine_ratio, NEW.event_key;
-			END IF;
-			NEW.engine_cache_hit_rate := engine_ratio;
 		ELSIF NEW.engine_cache_hit_rate IS NOT NULL THEN
 			IF claimed_engine THEN
 				RAISE EXCEPTION 'call_events: engine_cache_hit_rate % on event_key % has no engine_cached_tokens to derive it from',
@@ -425,7 +479,13 @@ FROM call_events;
 -- Every surface in this system can produce a plausible number that is wrong: an inflight counter
 -- that never decrements, a badge that returns 200 HTML, an average over rows that have no usage.
 -- This view is how those show up as something to look at instead of something to discover late.
-CREATE OR REPLACE VIEW call_quality AS
+-- Dropped and recreated rather than CREATE OR REPLACE, and that is not decoration: Postgres will not
+-- rename a view column through CREATE OR REPLACE, so the migration that split the fallback tiers into
+-- calls_joined_by_content and calls_joined_by_timing_only failed on an existing database with
+-- "cannot change name of view column". A schema file that only works on a database nobody has used
+-- yet is a schema file that works in CI and nowhere else.
+DROP VIEW IF EXISTS call_quality;
+CREATE VIEW call_quality AS
 SELECT
 	backend,
 	count(*) AS calls,
@@ -436,7 +496,9 @@ SELECT
 	count(*) FILTER (WHERE ts_is_observation) AS calls_with_observed_ts,
 	count(*) FILTER (WHERE source_count > 1) AS calls_joined_across_surfaces,
 	count(*) FILTER (WHERE upstream_id is not null) AS calls_with_upstream_id,
-	count(*) FILTER (WHERE join_method = 'backend_key_window') AS calls_joined_by_fallback,
+	count(*) FILTER (WHERE join_method = 'usage_content_window') AS calls_joined_by_content,
+	count(*) FILTER (WHERE join_method = 'backend_key_window') AS calls_joined_by_timing_only,
+	count(*) FILTER (WHERE cache_rate_undefined) AS calls_with_undefined_cache_rate,
 	-- How many rows carry the expert-cache rate at all. It is the axis most likely to be misread as
 	-- a prompt-cache rate, so its coverage belongs next to the two prompt-cache rates.
 	count(*) FILTER (WHERE expert_cache_hit_rate is not null) AS calls_with_expert_cache_rate,

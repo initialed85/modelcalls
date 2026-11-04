@@ -163,10 +163,18 @@ INSERT INTO call_events (
 -- because the router arrives before the engine does. Overlap stays as a secondary guard.
 --
 -- Also required: same backend; exactly one side carries a session key (a wire witness - two rows that
--- both have one are two calls, two that both lack one are two engine records); no upstream_id on the
--- candidate; source_count = 1 (a row already holding two surfaces is not a loose end); and EXACTLY
--- ONE candidate. Ambiguity is not resolved by guessing - it is left as two rows with join_method
--- 'self', which the quality view then reports as an unjoined pair.
+-- both have one are two calls, two that both lack one are two engine records); source_count = 1 (a row
+-- already holding two surfaces is not a loose end); and EXACTLY ONE candidate. Ambiguity is not
+-- resolved by guessing - it is left as two rows with join_method 'self', which the quality view then
+-- reports as an unjoined pair.
+--
+-- Two tiers, and this scenario walks the weak one. A candidate that has already been identified (it
+-- carries the runner's chatcmpl id, which rooter's ring records do now) may be joined ONLY by measured
+-- agreement: both sides reporting prompt and completion tokens, and those numbers equal. A candidate
+-- nobody has identified may be joined by the timing rule when at least one side measured no usage -
+-- which is the abandoned-stream case this path was built for. And when BOTH sides measured and their
+-- numbers disagree, neither tier fires: that is a different call, not a weak match. Step E2 below
+-- asserts the veto, because it is the rule that two live false positives bought.
 DO $$
 DECLARE
 	candidate text;
@@ -177,12 +185,26 @@ DECLARE
 	-- One wire witness only. $4 is the incoming event's session key: NULL here, because this is the
 	-- runner's own record and a runner does not know who asked. The mirrored arm (incoming has a key,
 	-- candidate has none) is the other arrival order, and the Go suite tests both directions.
+	-- $6/$7 are the incoming event's prompt and completion token counts, and NULL means "this surface
+	-- measured none" - which is what switches the tiers over.
 	sel text := '
 		SELECT event_key FROM call_events
 		 WHERE backend = ''strata''
 		   AND (($4::text IS NOT NULL AND "key" IS NULL) OR ($4::text IS NULL AND "key" IS NOT NULL))
-		   AND upstream_id IS NULL
 		   AND source_count = 1
+		   AND NOT (
+				   prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+			       AND $6::bigint IS NOT NULL AND $7::bigint IS NOT NULL
+			       AND (prompt_tokens <> $6 OR completion_tokens <> $7)
+			   )
+		   AND (
+			       upstream_id IS NULL
+			       OR (
+				   prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+				   AND $6::bigint IS NOT NULL AND $7::bigint IS NOT NULL
+				   AND prompt_tokens = $6 AND completion_tokens = $7
+			       )
+		   )
 		   AND abs(extract(epoch from ts) - extract(epoch from $1))
 		       <= ($3 + coalesce(wait_ms, 0) + coalesce($5, 0)) / 1000.0
 		   AND ts + (coalesce(total_ms, 0) * interval ''1 millisecond'')
@@ -190,11 +212,11 @@ DECLARE
 		   AND ts <= $1 + ($2 * interval ''1 millisecond'') + ($3 * interval ''1 millisecond'')
 		 ORDER BY ts';
 BEGIN
-	EXECUTE sel INTO candidate USING incoming, incoming_ms, 2000.0, NULL, 0.0;
+	EXECUTE sel INTO candidate USING incoming, incoming_ms, 2000.0, NULL, 0.0, 103623, 640;
 	IF candidate IS NULL THEN
 		n := 0;
 	ELSE
-		EXECUTE 'SELECT count(*) FROM (' || sel || ') x' USING incoming, incoming_ms, 2000.0, NULL, 0.0 INTO n;
+		EXECUTE 'SELECT count(*) FROM (' || sel || ') x' USING incoming, incoming_ms, 2000.0, NULL, 0.0, 103623, 640 INTO n;
 	END IF;
 
 	IF n = 1 THEN
@@ -223,10 +245,80 @@ BEGIN
 		RAISE NOTICE 'step E: no candidate, inserting a new row';
 	ELSE
 		RAISE NOTICE 'step E: % candidates, refusing to guess - inserting a separate row', n;
-	END IF;
-END $$;
+	END IF;END $$;
 
--- ══ F. two calls the router rejected; no runner ever saw either one ═════════════════════════
+-- ══ E2. measured agreement decides where a clock cannot ════════════════════════════════════
+-- The rules step E does not exercise, because its candidate has no usage numbers and no id: what
+-- happens when the candidate is a row that ALREADY names its call (rooter's ring records carry the
+-- runner's chatcmpl id, so this is the normal case now, not the odd one).
+--
+-- Insert a call rooter fully witnessed - id present, prompt and completion measured - then look for it
+-- twice: once with an engine record whose numbers agree, once with one whose numbers do not. Same
+-- backend, same session key absent, same timestamp offset of 400 ms, which is comfortably inside the
+-- window. The only difference between the two probes is whether the tokens match, so whatever the
+-- counts come back as, they are reporting the content rule and nothing else.
+INSERT INTO call_events (
+	event_key, source, source_ids, id, upstream_id, ts, backend, alias, profile,
+	model, kind, "key", key_source, path, method, stream, status, bytes,
+	aborted, wait_ms, total_ms, prompt_tokens, completion_tokens, cached_tokens, usage_source, extra
+) VALUES (
+	'rooter|r-1006', 'rooter', '{rooter|r-1006}', 'r-1006', 'chatcmpl-ccc', '2026-11-04T09:00:40Z', 'strata',
+	'strata', 'iq3_xxs', 'qwen3.8-flash-next-iq3_xxs', 'gen', 'pi-code', 'header',
+	'/v1/chat/completions', 'POST', true, 200, 60000, true, 2.0, 5000.0, 30000, 500, 29800, 'none',
+	'{"rooter": {"raw": {"note": "a fully witnessed call: id present, usage present"}}}'::jsonb
+);
+
+DO $$
+DECLARE
+	found bigint;
+	who text;
+	probe_sel text := '
+		SELECT event_key FROM call_events
+		 WHERE backend = ''strata''
+		   AND (($4::text IS NOT NULL AND "key" IS NULL) OR ($4::text IS NULL AND "key" IS NOT NULL))
+		   AND source_count = 1
+		   AND NOT (
+				   prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+			       AND $6::bigint IS NOT NULL AND $7::bigint IS NOT NULL
+			       AND (prompt_tokens <> $6 OR completion_tokens <> $7)
+			   )
+		   AND (
+			       upstream_id IS NULL
+			       OR (
+				   prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+				   AND $6::bigint IS NOT NULL AND $7::bigint IS NOT NULL
+				   AND prompt_tokens = $6 AND completion_tokens = $7
+			       )
+		   )
+		   AND abs(extract(epoch from ts) - extract(epoch from $1))
+		       <= ($3 + coalesce(wait_ms, 0) + coalesce($5, 0)) / 1000.0
+		 ORDER BY ts';
+BEGIN
+	-- Agreeing numbers: the candidate is identified, so ONLY content can reach it.
+	EXECUTE probe_sel INTO who USING '2026-11-04T09:00:40.4Z'::timestamptz, 9600.0, 2000.0, NULL, 0.0,
+	                                30000, 500;
+	IF who IS DISTINCT FROM 'rooter|r-1006' THEN
+		raise exception 'step E2 wrong: agreeing numbers found % (want rooter|r-1006). An identified row is
+			reachable by content alone, and content is exactly what agrees here', who;
+	END IF;
+
+	-- Disagreeing numbers, same clock offset. This is the live case that a timing-only rule called a
+	-- match: 49903 prompt tokens against the candidate's 66933, 90 ms apart.
+	EXECUTE 'SELECT count(*) FROM (' || probe_sel || ') x'
+		USING '2026-11-04T09:00:40.4Z'::timestamptz, 9600.0, 2000.0, NULL, 0.0, 44333, 1395
+		INTO found;
+	IF found <> 0 THEN
+		raise exception 'step E2 wrong: disagreeing numbers found % candidates (want 0). Two measurements of the same call do not disagree by 15,000 tokens - a veto is not optional', found;
+	END IF;
+
+	RAISE NOTICE 'step E2: an identified row is reachable by content only, and disagreement vetoes the join';
+
+	-- This step measures a rule; it does not contribute a call to the corpus. The assertions below
+	-- count exact numbers of calls, joins and unusable rows, and a probe row would move all three
+	-- while proving nothing about them. Delete it, and say why here rather than in a bug report later.
+	DELETE FROM call_events WHERE event_key = 'rooter|r-1006';
+END $$;
+-- ══ F. two calls the router rejected; no runner ever saw either one ══════════════════
 -- 401s rooter answered itself. No backend, no upstream_id, no id-shaped thing from a runner. They
 -- must coexist as two rows, which is why both join indexes exclude NULL and empty string instead
 -- of treating them as values that identify a call.
@@ -365,7 +457,8 @@ BEGIN
 	SELECT * INTO q FROM call_quality WHERE backend = 'strata';
 	IF q.calls <> 2 THEN RAISE EXCEPTION 'strata calls = %, want 2 (r-1001, r-1002)', q.calls; END IF;
 	IF q.calls_joined_across_surfaces <> 2 THEN RAISE EXCEPTION 'strata joined = %, want 2', q.calls_joined_across_surfaces; END IF;
-	IF q.calls_joined_by_fallback <> 1 THEN RAISE EXCEPTION 'strata by_fallback = %, want 1', q.calls_joined_by_fallback; END IF;
+	IF q.calls_joined_by_timing_only <> 1 THEN RAISE EXCEPTION 'strata by_timing_only = %, want 1 (r-1002 merged with no usage on either side and one wire witness - the weak tier, named as such)', q.calls_joined_by_timing_only; END IF;
+	IF q.calls_joined_by_content <> 0 THEN RAISE EXCEPTION 'strata by_content = %, want 0 (the content tier is exercised by step E2, which deletes its probe row rather than adding a third call to this corpus)', q.calls_joined_by_content; END IF;
 	IF q.calls_aborted <> 1 THEN RAISE EXCEPTION 'strata aborted = %, want 1', q.calls_aborted; END IF;
 	IF q.calls_with_observed_ts <> 0 THEN RAISE EXCEPTION 'strata observed_ts = %, want 0', q.calls_with_observed_ts; END IF;
 	IF q.calls_without_usage <> 0 THEN RAISE EXCEPTION 'strata without_usage = %, want 0 (both learned usage)', q.calls_without_usage; END IF;
@@ -379,7 +472,7 @@ BEGIN
 	IF q.calls <> 1 THEN RAISE EXCEPTION 'sushi calls = %, want 1', q.calls; END IF;
 	IF q.calls_with_observed_ts <> 1 THEN RAISE EXCEPTION 'sushi observed_ts = %, want 1', q.calls_with_observed_ts; END IF;
 
-	RAISE NOTICE 'contract holds: 5 calls, 2 joined across surfaces (1 by upstream_id, 1 by fallback), 1 abandoned stream counted at all, 2 unusable for aggregates, 1 observed timestamp flagged';
+	RAISE NOTICE 'contract holds: 5 calls, 2 joined across surfaces (1 by upstream_id, 1 by timing only - and the content tier is proved separately in E2), 1 abandoned stream counted at all, 2 unusable for aggregates, 1 observed timestamp flagged';
 END $$;
 
 -- ══ I. the cache rates cannot be supplied ═════════════════════════════════════════════
@@ -391,6 +484,7 @@ END $$;
 DO $$
 DECLARE
 	rejected boolean;
+	chk record;
 BEGIN
 	-- Smuggling the expert rate into the prompt-reuse column: right shape, right range, wrong
 	-- quantity. Nothing about the row would reveal it afterwards.
@@ -417,16 +511,43 @@ BEGIN
 		RAISE EXCEPTION 'rates: a cache_hit_rate with no cached_tokens was accepted';
 	END IF;
 
-	-- More cached than prompt: two surfaces describing different calls, agreeing by accident. This
-	-- is the fallback join failing, and it must be loud.
+	-- More cached than prompt. This one reverses a decision this schema made confidently: it used to be
+	-- an exception, on the theory that only a bad join could produce it. llama.cpp's prompt_n can be
+	-- genuinely smaller than the cached span it reused - which is why rooter publishes
+	-- prompt_tokens_computed at all - and rejecting the statement threw away a call a router had fully
+	-- witnessed because a DERIVED ratio was undefined. The store reported a write failure when the true
+	-- news was "this one rate is unusable". The rate goes NULL, the row admits it, and the components
+	-- stay so the ratio can be recomputed when a better prompt count turns up.
+	UPDATE call_events SET cached_tokens = 120000 WHERE event_key = 'rooter|r-1001';
+	SELECT cache_hit_rate, cache_rate_undefined, cached_tokens, prompt_tokens INTO chk
+		FROM call_events WHERE event_key = 'rooter|r-1001';
+	IF chk.cache_hit_rate IS NOT NULL THEN
+		raise exception 'rates: cached_tokens 120000 against prompt_tokens % produced cache_hit_rate % - an undeterminable rate has to be NULL', chk.prompt_tokens, chk.cache_hit_rate;
+	END IF;
+	IF NOT chk.cache_rate_undefined THEN
+		raise exception 'rates: the row hides an undefined rate instead of flagging cache_rate_undefined';
+	END IF;
+	IF chk.cached_tokens <> 120000 THEN
+		raise exception 'rates: the components were sacrificed to fix a rate (cached_tokens is now %)', chk.cached_tokens;
+	END IF;
+
+	-- A CLAIMED rate on those same components is still refused. Nothing is derivable from them, so a
+	-- number appearing here came from somewhere else - which is exactly how an expert-cache rate lands
+	-- in a prompt-reuse column.
 	rejected := false;
 	BEGIN
-		UPDATE call_events SET cached_tokens = 120000 WHERE event_key = 'rooter|r-1001';
+		UPDATE call_events SET cache_hit_rate = 0.848 WHERE event_key = 'rooter|r-1001';
 	EXCEPTION WHEN raise_exception THEN
 		rejected := true;
 	END;
 	IF NOT rejected THEN
-		RAISE EXCEPTION 'rates: cached_tokens exceeding prompt_tokens was accepted';
+		raise exception 'rates: a claimed cache_hit_rate survived components that cannot support it';
+	END IF;
+
+	-- Back to a consistent numerator for the positive control below.
+	UPDATE call_events SET cached_tokens = 106677 WHERE event_key = 'rooter|r-1001';
+	IF (SELECT cache_rate_undefined FROM call_events WHERE event_key = 'rooter|r-1001') THEN
+		raise exception 'rates: cache_rate_undefined stayed true after the components became consistent';
 	END IF;
 
 	-- No denominator, so nothing in the row supports a rate.

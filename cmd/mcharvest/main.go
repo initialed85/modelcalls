@@ -110,7 +110,7 @@ func pass(ctx context.Context, st *store.Store, rooter *sources.Rooter, strata *
 				errs = append(errs, fmt.Errorf("write %s: %w", ev.EventKey, err))
 				continue
 			}
-			counts[res.Path]++
+			tally(counts, res)
 		}
 	}
 
@@ -125,7 +125,7 @@ func pass(ctx context.Context, st *store.Store, rooter *sources.Rooter, strata *
 				errs = append(errs, fmt.Errorf("write %s: %w", ev.EventKey, err))
 				continue
 			}
-			counts[res.Path]++
+			tally(counts, res)
 		}
 	}
 
@@ -139,9 +139,34 @@ func pass(ctx context.Context, st *store.Store, rooter *sources.Rooter, strata *
 	return nil
 }
 
+// tally counts a write by what actually happened to it. A fallback join is reported as the tier that
+// fired rather than as one anonymous join_fallback, because content agreement and clock agreement
+// answer different questions - one says two surfaces measured the same work, the other says nothing
+// measured it and they happened at nearly the same time. The schema already records them under
+// separate join_method values for exactly this reason; a harvester that collapsed them back into one
+// counter would throw the distinction away at the only place anyone is looking.
+func tally(counts map[string]int, res store.Result) {
+	if res.Path == store.PathJoinFallback {
+		switch res.JoinMethod {
+		case "usage_content_window":
+			counts["join_by_content"]++
+			return
+		case "backend_key_window":
+			counts["join_by_timing"]++
+			return
+		default:
+			// A join that reports a method this command does not know is a schema/store drift, and it
+			// must not be silently counted as either tier. Count it where it can be noticed.
+			counts[store.PathJoinFallback]++
+			return
+		}
+	}
+	counts[res.Path]++
+}
+
 func summary(counts map[string]int) string {
-	order := []string{store.PathRePull, store.PathJoinUpstream, store.PathJoinFallback,
-		store.PathInsert, store.PathUnattributed}
+	order := []string{store.PathRePull, store.PathJoinUpstream, "join_by_content", "join_by_timing",
+		store.PathJoinFallback, store.PathInsert, store.PathUnattributed}
 	out := ""
 	for _, k := range order {
 		if counts[k] > 0 {

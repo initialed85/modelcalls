@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -109,14 +110,23 @@ func setup(t *testing.T) (context.Context, *store.Store) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	// Migration first (it is idempotent), then a truncate: the contract is only meaningful from a
-	// known empty state, and a fresh database has nothing to truncate.
-	sqlBytes, err := os.ReadFile(filepath.Join("..", "..", "migrations", "001_initial.sql"))
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
+	// Migrations first (each is idempotent), in name order, then a truncate: the contract is only
+	// meaningful from a known empty state, and a fresh database has nothing to truncate. Name order
+	// rather than one hardcoded file, because a test harness that applies only 001 never executes the
+	// upgrade path - and the upgrade path is where 002's reason for existing lives.
+	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("find migrations: %v", err)
 	}
-	if err := st.Migrate(ctx, sqlBytes); err != nil {
-		t.Fatalf("migrate: %v", err)
+	sort.Strings(files)
+	for _, name := range files {
+		sqlBytes, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read migration %s: %v", name, err)
+		}
+		if err := st.Migrate(ctx, sqlBytes); err != nil {
+			t.Fatalf("migrate %s: %v", filepath.Base(name), err)
+		}
 	}
 	if _, err := st.DB().ExecContext(ctx, "TRUNCATE TABLE call_events"); err != nil {
 		t.Fatalf("truncate: %v", err)
@@ -491,26 +501,27 @@ func TestContract(t *testing.T) {
 	})
 
 	t.Run("K_the_store_reports_its_own_shape", func(t *testing.T) {
-		var calls, withUsage, withoutUsage, aborted, joined, byFallback, observed int
+		var calls, withUsage, withoutUsage, aborted, joined, byContent, byTiming, observed int
 		err := st.DB().QueryRow(`
 			SELECT count(*),
 			       count(*) FILTER (WHERE has_usage),
 			       count(*) FILTER (WHERE NOT has_usage),
 			       count(*) FILTER (WHERE aborted),
 			       count(*) FILTER (WHERE source_count > 1),
+			       count(*) FILTER (WHERE join_method = 'usage_content_window'),
 			       count(*) FILTER (WHERE join_method = 'backend_key_window'),
 			       count(*) FILTER (WHERE ts_is_observation)
-			  FROM call_events`).Scan(&calls, &withUsage, &withoutUsage, &aborted, &joined, &byFallback, &observed)
+			  FROM call_events`).Scan(&calls, &withUsage, &withoutUsage, &aborted, &joined, &byContent, &byTiming, &observed)
 		if err != nil {
 			t.Fatalf("shape: %v", err)
 		}
-		t.Logf("store shape: %d calls, %d with usage, %d without, %d abandoned, %d joined across surfaces, %d by fallback, %d with an observed timestamp",
-			calls, withUsage, withoutUsage, aborted, joined, byFallback, observed)
+		t.Logf("store shape: %d calls, %d with usage, %d without, %d abandoned, %d joined across surfaces, %d joined by content, %d joined by timing only, %d with an observed timestamp",
+			calls, withUsage, withoutUsage, aborted, joined, byContent, byTiming, observed)
 		if calls == 0 {
 			t.Fatal("empty store")
 		}
-		if byFallback > joined {
-			t.Errorf("fallback joins (%d) exceed upstream joins: the heuristic is doing more work than the reliable key, which is a design smell worth noticing", byFallback)
+		if byContent+byTiming > joined {
+			t.Errorf("fallback joins (%d+%d) exceed upstream joins: the heuristics are doing more work than the reliable key, which is a design smell worth noticing", byContent, byTiming)
 		}
 	})
 }
@@ -604,12 +615,6 @@ func TestCacheRatesAreDerivedNotSupplied(t *testing.T) {
 			name:  "rate with no cached_tokens",
 			set:   "cached_tokens = NULL, cache_hit_rate = 0.9",
 			wants: "no cached_tokens",
-		},
-		{
-			// More cached than prompt: two surfaces describing different calls, agreeing by accident.
-			name:  "cached_tokens exceeds prompt_tokens",
-			set:   "cached_tokens = 120000",
-			wants: "exceeds prompt_tokens",
 		},
 		{
 			// The denominator is gone, so nothing in this row supports a rate.
@@ -763,4 +768,331 @@ func TestFallbackAttributionRestartsFromStartProximity(t *testing.T) {
 			t.Errorf("rows = %d, want 1: the call rooter reported is one call, not two", n)
 		}
 	})
+}
+
+// TestUndeterminableRatesAndComputedPromptCounts is the part of the contract that reverses an earlier
+// decision, and it reverses it for a reason that cost data: this schema used to RAISE when
+// cached_tokens exceeded prompt_tokens, on the theory that only a bad join could do that. llama.cpp's
+// `prompt_n` is not the whole prompt - it is the tokens the runner processed on this pass - so the
+// runner's own numbers can legitimately point that way, and rooter publishes prompt_tokens_computed
+// beside the reported count instead of overwriting it. Rejecting the row threw away a call a router had
+// fully witnessed, over a ratio that cannot be computed. The rate goes NULL, the row flags it, and the
+// components survive. A CLAIMED rate is still refused, because components that support no rate mean any
+// number in that column came from somewhere else.
+func TestUndeterminableRatesAndComputedPromptCounts(t *testing.T) {
+	ctx, st := setup(t)
+	ts := time.Now().UTC().Add(-900 * time.Second)
+
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|r-4001", Source: "rooter", SourceIDs: []string{"rooter|r-4001"}, TS: ts,
+		Backend: str("strata"), Key: str("pi-code"), UsageSource: store.UsageNone,
+		PromptTokens: i64(106718), CompletionTokens: i64(641), CachedTokens: i64(106677),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	t.Run("a_rate_the_components_cannot_produce_is_null_and_flagged", func(t *testing.T) {
+		if _, err := st.DB().ExecContext(ctx,
+			"UPDATE call_events SET cached_tokens = 120000 WHERE event_key = $1", "rooter|r-4001"); err != nil {
+			t.Fatalf("accepted a write that should have succeeded: %v", err)
+		}
+		var rate sql.NullFloat64
+		var undefined bool
+		var cached, prompt int64
+		if err := st.DB().QueryRowContext(ctx, `SELECT cache_hit_rate, cache_rate_undefined, cached_tokens, prompt_tokens
+			FROM call_events WHERE event_key = $1`, "rooter|r-4001").
+			Scan(&rate, &undefined, &cached, &prompt); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if rate.Valid {
+			t.Errorf("cache_hit_rate = %v, want NULL: 120000 cached over %d prompt tokens is not a rate", rate.Float64, prompt)
+		}
+		if !undefined {
+			t.Error("cache_rate_undefined false: the row is hiding that its rate is unusable")
+		}
+		if cached != 120000 {
+			t.Errorf("cached_tokens = %d, want 120000: the components are the data, the rate is a derived read of them", cached)
+		}
+		if prompt != 106718 {
+			t.Errorf("prompt_tokens = %d, want the reported count preserved", prompt)
+		}
+
+		// A claimed rate on these components is still refused in both directions.
+		if _, err := st.DB().ExecContext(ctx,
+			"UPDATE call_events SET cache_hit_rate = 0.848 WHERE event_key = $1", "rooter|r-4001"); err == nil {
+			t.Error("accepted a claimed rate on components that support no rate: that number came from somewhere else")
+		} else if !strings.Contains(err.Error(), "support no rate") {
+			t.Errorf("error = %q, want it to say the components support no rate", err)
+		}
+
+		// Consistent components again: the rate comes back and the flag goes away on its own.
+		if _, err := st.DB().ExecContext(ctx,
+			"UPDATE call_events SET cached_tokens = 106677 WHERE event_key = $1", "rooter|r-4001"); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		if err := st.DB().QueryRowContext(ctx, `SELECT cache_hit_rate, cache_rate_undefined FROM call_events WHERE event_key = $1`,
+			"rooter|r-4001").Scan(&rate, &undefined); err != nil {
+			t.Fatalf("read back after restore: %v", err)
+		}
+		if !rate.Valid || rate.Float64 < 0.999 || rate.Float64 > 1.0 {
+			t.Errorf("cache_hit_rate = %v, want the derived ratio back: %v/%v", rate, 106677, 106718)
+		}
+		if undefined {
+			t.Error("cache_rate_undefined still true after the components became consistent")
+		}
+	})
+
+	t.Run("the_engine_rate_behaves_the_same_way", func(t *testing.T) {
+		if _, err := st.DB().ExecContext(ctx,
+			"UPDATE call_events SET engine_cached_tokens = 130000 WHERE event_key = $1", "rooter|r-4001"); err != nil {
+			t.Fatalf("accepted a write that should have succeeded: %v", err)
+		}
+		var engineRate sql.NullFloat64
+		var wireRate sql.NullFloat64
+		var undefined bool
+		if err := st.DB().QueryRowContext(ctx, `SELECT engine_cache_hit_rate, cache_hit_rate, cache_rate_undefined
+			FROM call_events WHERE event_key = $1`, "rooter|r-4001").
+			Scan(&engineRate, &wireRate, &undefined); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if engineRate.Valid {
+			t.Errorf("engine_cache_hit_rate = %v, want NULL", engineRate.Float64)
+		}
+		if !wireRate.Valid {
+			t.Errorf("cache_hit_rate = %v, want the wire rate untouched: an unusable ENGINE rate is not this row's problem", wireRate)
+		}
+		if !undefined {
+			t.Error("cache_rate_undefined false: an engine component out of range is the same state")
+		}
+		if _, err := st.DB().ExecContext(ctx,
+			"UPDATE call_events SET engine_cached_tokens = 106677 WHERE event_key = $1", "rooter|r-4001"); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	})
+
+	t.Run("a_computed_prompt_count_is_its_own_number", func(t *testing.T) {
+		// rooter reports prompt_n and its own arithmetic answer. Both are stored. Neither replaces the
+		// other, in either direction, and a computed count alone does not make a row usable in a token
+		// aggregate - has_usage means the runner reported the counts it billed. Live rooter payload:
+		// prompt_tokens 98060, prompt_tokens_computed 98060, extra.prompt_n 98060.
+		if _, err := st.Write(ctx, store.Event{
+			EventKey: "rooter|r-4002", Source: "rooter", SourceIDs: []string{"rooter|r-4002"}, TS: ts.Add(60 * time.Second),
+			Backend: str("sushi"), Key: str("pi-code"), UsageSource: store.UsageNone,
+			PromptTokens: i64(98060), PromptTokensComputed: i64(98389), CompletionTokens: i64(289),
+		}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		var reported, computed sql.NullInt64
+		var hasUsage bool
+		if err := st.DB().QueryRowContext(ctx, `SELECT prompt_tokens, prompt_tokens_computed, has_usage
+			FROM call_events WHERE event_key = $1`, "rooter|r-4002").
+			Scan(&reported, &computed, &hasUsage); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if reported.Int64 != 98060 || computed.Int64 != 98389 {
+			t.Errorf("reported = %d computed = %d, want 98060 and 98389 kept apart: overwriting either one erases the evidence of how often they differ",
+				reported.Int64, computed.Int64)
+		}
+		if !hasUsage {
+			t.Error("has_usage false: the reported counts are present, so this row is aggregateable")
+		}
+
+		// A surface that only ever publishes the computed answer cannot smuggle it into the reported
+		// column: prompt_tokens stays NULL and the row stays out of token aggregates.
+		if _, err := st.Write(ctx, store.Event{
+			EventKey: "rooter|r-4003", Source: "rooter", SourceIDs: []string{"rooter|r-4003"}, TS: ts.Add(120 * time.Second),
+			Backend: str("sushi"), Key: str("pi-code"), UsageSource: store.UsageNone,
+			PromptTokensComputed: i64(4242), CompletionTokens: i64(12),
+		}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := st.DB().QueryRowContext(ctx, `SELECT prompt_tokens, prompt_tokens_computed, has_usage
+			FROM call_events WHERE event_key = $1`, "rooter|r-4003").
+			Scan(&reported, &computed, &hasUsage); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if reported.Valid {
+			t.Errorf("prompt_tokens = %d, want NULL: a computed guess did not become a reported count", reported.Int64)
+		}
+		if computed.Int64 != 4242 {
+			t.Errorf("prompt_tokens_computed = %d, want 4242 stored as what it is", computed.Int64)
+		}
+		if hasUsage {
+			t.Error("has_usage true: an arithmetic estimate is not a count the runner billed")
+		}
+	})
+}
+
+// TestContentAgreementIsWhatClosesAJoin is this file's second correction, and it came from a live
+// capture rather than from a thought experiment. Rooter's ring records turned out to carry the
+// runner's chatcmpl id, so the rows reaching the fallback are mostly rows that ALREADY name their
+// call - and a fallback that refuses every identified candidate, as this one did, joins nothing while
+// continuing to look correct. Meanwhile 35 rooter events against 12 strata records produced pairs that
+// matched to the token (prompt 66933/66933, cached 66509/66509, completion 549/549) while the routers'
+// own total_ms differed by 450 ms, and pairs that matched on nothing but a clock (-0.09 s and -0.10 s)
+// while reporting 49903 against 66933 prompt tokens and 183 against 1395 completion tokens.
+//
+// So: content decides when both sides measured, a clock is allowed only where nothing was measured and
+// nobody has identified the row yet, and disagreement between two measurements is a veto rather than a
+// weak match.
+func TestContentAgreementIsWhatClosesAJoin(t *testing.T) {
+	ctx, st := setup(t)
+	base := time.Now().UTC().Truncate(time.Microsecond).Add(-3600 * time.Second)
+
+	witness := func(key, upstreamID string, ts time.Time, prompt, completion, cached *int64) store.Event {
+		ev := store.Event{
+			EventKey: key, Source: "rooter", SourceIDs: []string{key}, TS: ts,
+			Backend: str("strata"), Key: str("pi-code"), KeySource: str("header"),
+			Status: ival(200), Stream: bval(true), TotalMs: f64(10250.4),
+			WaitMs: f64(0.004), UsageSource: store.UsageNone,
+		}
+		if upstreamID != "" {
+			ev.UpstreamID = str(upstreamID)
+		}
+		ev.PromptTokens, ev.CompletionTokens, ev.CachedTokens = prompt, completion, cached
+		return ev
+	}
+	engine := func(key string, ts time.Time, prompt, completion, cached int64) store.Event {
+		return store.Event{
+			EventKey: key, Source: "strata", SourceIDs: []string{key}, TS: ts, Backend: str("strata"),
+			PromptTokens: i64(prompt), CompletionTokens: i64(completion),
+			CachedTokens: i64(cached), EngineCachedTokens: i64(cached),
+			DecodeTokS: f64(56.4), TotalMs: f64(9800.0),
+			UsageSource: store.UsageRunnerScrape, RequireAttribution: true,
+		}
+	}
+
+	t.Run("numbers_that_agree_join_a_row_that_already_names_its_call", func(t *testing.T) {
+		// rooter /31 against strata, as captured live. The envelope is identified - it has the runner's
+		// chatcmpl id - and the old rule would have refused it out of hand.
+		if _, err := st.Write(ctx, witness("rooter|31", "chatcmpl-b434b754", base,
+			i64(66933), i64(549), i64(66509))); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|5628878f244b", base.Add(380*time.Millisecond),
+			66933, 549, 66509))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathJoinFallback {
+			t.Fatalf("path = %q, want join_fallback", res.Path)
+		}
+		r := fetch(t, st, "rooter|31")
+		if r.JoinMethod.String != "usage_content_window" {
+			t.Errorf("join_method = %q, want usage_content_window: a content join must not wear the same name as a clock join", r.JoinMethod.String)
+		}
+		if r.UpstreamID.String != "chatcmpl-b434b754" {
+			t.Errorf("upstream_id = %q, want the envelope's own id preserved", r.UpstreamID.String)
+		}
+		if r.DecodeTokS.Float64 != 56.4 {
+			t.Errorf("decode_tok_s = %v, want the engine's number (56.4): this is the axis the envelope cannot produce", r.DecodeTokS)
+		}
+		if r.SourceCount != 2 {
+			t.Errorf("source_count = %d, want 2", r.SourceCount)
+		}
+	})
+
+	t.Run("two_measurements_that_disagree_are_not_one_call_however_close_the_clocks", func(t *testing.T) {
+		// The live false positives: rooter /32 sat 90 ms from a strata record and reported 49903 prompt
+		// tokens against that record's 66933; rooter /40 sat 100 ms from another with 183 completion
+		// tokens against 1395. Timing alone called both of them the same call.
+		if _, err := st.Write(ctx, witness("rooter|32", "chatcmpl-49903", base,
+			i64(49903), i64(67), i64(49126))); err != nil {
+			t.Fatalf("seed 32: %v", err)
+		}
+		if _, err := st.Write(ctx, witness("rooter|40", "", base.Add(60*time.Second),
+			i64(52922), i64(183), i64(52887))); err != nil {
+			t.Fatalf("seed 40: %v", err)
+		}
+		for _, c := range []struct {
+			key     string
+			ts      time.Time
+			prompt  int64
+			compl   int64
+			cached  int64
+			witness string
+			why     string
+		}{
+			{"strata|against-32", base.Add(-90 * time.Millisecond), 66933, 549, 66509, "rooter|32",
+				"identified candidate, and the tokens disagree"},
+			{"strata|against-40", base.Add(60*time.Second - 100*time.Millisecond), 44333, 1395, 0, "rooter|40",
+				"unidentified candidate, but both sides measured and the tokens disagree"},
+		} {
+			res, err := st.Write(ctx, engine(c.key, c.ts, c.prompt, c.compl, c.cached))
+			if err != nil {
+				t.Fatalf("%s: %v", c.key, err)
+			}
+			if res.Path != store.PathUnattributed {
+				t.Errorf("%s path = %q, want unattributed: %s", c.key, res.Path, c.why)
+			}
+			r := fetch(t, st, c.witness)
+			if r.SourceCount != 1 {
+				t.Errorf("%s source_count = %d, want 1: the envelope kept its own numbers", c.witness, r.SourceCount)
+			}
+			if r.DecodeTokS.Valid {
+				t.Errorf("%s decode_tok_s = %v, want NULL: someone else's decode rate must not land here", c.witness, r.DecodeTokS)
+			}
+			if r.PromptTokens.Int64 != promptOf(c.witness) {
+				t.Errorf("%s prompt_tokens = %d, want the envelope's own %d", c.witness, r.PromptTokens.Int64, promptOf(c.witness))
+			}
+		}
+	})
+
+	t.Run("an_identified_row_with_no_usage_is_not_filled_by_a_clock", func(t *testing.T) {
+		// The strict half of the rule, and it costs something: an abandoned call that rooter identified
+		// but got no token counts for stays without engine numbers, because the only evidence linking it
+		// to an engine record is that they happened at nearly the same time. Those rows keep
+		// has_usage = false and show up in call_quality as such. Refusing here is a real loss, and it is
+		// smaller than inventing a number inside a row a reader already trusts.
+		if _, err := st.Write(ctx, witness("rooter|abandoned", "chatcmpl-abandoned", base.Add(300*time.Second),
+			nil, nil, nil)); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|near-abandoned", base.Add(300*time.Second+40*time.Millisecond),
+			1000, 200, 900))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathUnattributed {
+			t.Fatalf("path = %q, want unattributed", res.Path)
+		}
+		r := fetch(t, st, "rooter|abandoned")
+		if r.HasUsage {
+			t.Error("has_usage true: numbers arrived on a row whose only link to them is a timestamp")
+		}
+		if n := count(t, st, "event_key = 'strata|near-abandoned'"); n != 0 {
+			t.Errorf("rows = %d, want 0: the engine's record is reported, not inserted as a call", n)
+		}
+	})
+
+	t.Run("a_row_nobody_has_identified_is_still_rescuable_by_timing", func(t *testing.T) {
+		// The case the fallback was built for, kept working: a client gave up before the frame carrying
+		// the id arrived, so the envelope has no id and no usage, and the engine's record is the only
+		// account of what the work cost.
+		if _, err := st.Write(ctx, witness("rooter|orphan", "", base.Add(600*time.Second), nil, nil, nil)); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|orphan-work", base.Add(600*time.Second+50*time.Millisecond),
+			4000, 120, 3900))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathJoinFallback {
+			t.Fatalf("path = %q, want join_fallback", res.Path)
+		}
+		if r := fetch(t, st, "rooter|orphan"); r.JoinMethod.String != "backend_key_window" {
+			t.Errorf("join_method = %q, want backend_key_window: this join rests on a clock and has to say so", r.JoinMethod.String)
+		}
+	})
+}
+
+func promptOf(eventKey string) int64 {
+	switch eventKey {
+	case "rooter|32":
+		return 49903
+	case "rooter|40":
+		return 52922
+	default:
+		return 0
+	}
 }

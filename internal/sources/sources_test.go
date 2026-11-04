@@ -21,7 +21,7 @@ func TestStrataPull(t *testing.T) {
 	  "requests": [
 	    {"id": "5628878f244b", "time": 1793761423.6647432, "duration_s": 125.6,
 	     "prompt_ms": 900.0, "decode_ms": 124600.0, "prompt_tokens": 78049, "prompt_total": 78049,
-	     "prompt_read": 800, "reused": 77279, "output_tokens": 1900, "decode_tok_s": 56.4,
+	     "prompt_read": 770, "reused": 77279, "output_tokens": 1900, "decode_tok_s": 56.4,
 	     "hit_rate": 0.888, "finish": "stop", "first_engine_token_s": 0.9,
 	     "drafts_offered": 400, "drafts_accepted": 260, "engine_generated": 1900, "projection": false},
 	    {"id": "aaaaaaaaaaaa", "time": 1793761500.5, "duration_s": 4.7, "prompt_ms": 40.0,
@@ -74,6 +74,13 @@ func TestStrataPull(t *testing.T) {
 	if ev.PromptTokens == nil || *ev.PromptTokens != 78049 {
 		t.Errorf("prompt_tokens = %v, want prompt_total (78049)", ev.PromptTokens)
 	}
+	// strata's own components satisfy read + reused == total (770 + 77279 = 78049), which is what the
+	// live capture showed as well (385 + 61867 = 62252). That identity is exactly what llama.cpp's
+	// prompt_n breaks elsewhere - which is why rooter publishes a computed count - and it is recorded
+	// here as a fact about this surface rather than an assumption carried into the others.
+	if ev.PromptTokens != nil && *ev.PromptTokens != 770+77279 {
+		t.Errorf("prompt_total %d does not equal prompt_read + reused (770 + 77279)", *ev.PromptTokens)
+	}
 	if ev.CachedTokens == nil || *ev.CachedTokens != 77279 || ev.EngineCachedTokens == nil || *ev.EngineCachedTokens != 77279 {
 		t.Errorf("cached = %v engine_cached = %v, want both to take `reused` (77279)", ev.CachedTokens, ev.EngineCachedTokens)
 	}
@@ -120,6 +127,7 @@ func TestRooterPull(t *testing.T) {
 		     "model": "qwen3.8-flash-next-iq3_xxs", "stream": true, "status": 200, "bytes": 4096,
 		     "aborted": true, "wait_ms": 2.4, "ttft_ms": 900.1, "total_ms": 125600.0,
 		     "cached_tokens": 77279, "prefill_ms": 900.0, "cache_hit_rate": 0.9901,
+		     "prompt_tokens": 98060, "prompt_tokens_computed": 98389,
 		     "finish_reason": "stop", "extra": {"raw": {"note": "tail empty"}}},
 		    {"id": "r-2", "ts": "not-a-time", "path": "/v1/models", "method": "GET", "kind": "read",
 		     "key": "pi-code", "key_source": "header", "backend": "", "status": 401, "bytes": 91}
@@ -142,6 +150,15 @@ func TestRooterPull(t *testing.T) {
 	ev := events[0]
 	if ev.RequireAttribution {
 		t.Error("RequireAttribution set on a rooter record: this is the surface that KNOWS a client asked")
+	}
+	// Rooter publishes its arithmetic answer for the prompt next to llama.cpp's reported count, and the
+	// two arrive as two fields here so the store can keep them as two columns. Deliberately unequal in
+	// this fixture, because equal values would not catch a translator that overwrites one with the other.
+	if ev.PromptTokens == nil || *ev.PromptTokens != 98060 {
+		t.Errorf("prompt_tokens = %v, want rooter's reported 98060", ev.PromptTokens)
+	}
+	if ev.PromptTokensComputed == nil || *ev.PromptTokensComputed != 98389 {
+		t.Errorf("prompt_tokens_computed = %v, want rooter's computed 98389 kept separate", ev.PromptTokensComputed)
 	}
 	if ev.UpstreamID == nil || *ev.UpstreamID != "chatcmpl-xyz" {
 		t.Errorf("upstream_id = %v, want chatcmpl-xyz: it is the only join key that means the same thing to both sides", ev.UpstreamID)

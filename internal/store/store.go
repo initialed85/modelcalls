@@ -106,10 +106,15 @@ type Event struct {
 	PromptMs *float64
 	DecodeMs *float64
 
-	PromptTokens       *int64
-	CompletionTokens   *int64
-	CachedTokens       *int64
-	EngineCachedTokens *int64
+	PromptTokens *int64
+	// PromptTokensComputed is the observer's arithmetic answer for the prompt length, kept apart from
+	// PromptTokens because llama.cpp's `prompt_n` is not the whole prompt and overwriting one with the
+	// other would erase the only evidence of how often they differ. A surface that has no separate
+	// computed value leaves it NULL; it is not filled in with the reported count.
+	PromptTokensComputed *int64
+	CompletionTokens     *int64
+	CachedTokens         *int64
+	EngineCachedTokens   *int64
 
 	PrefillTokS *float64
 	DecodeTokS  *float64
@@ -140,7 +145,8 @@ type Event struct {
 	// prompt-cache rate.
 	Extra map[string]any
 
-	// JoinMethod is set by the store, not the caller: self | upstream_id | backend_key_window.
+	// JoinMethod is set by the store, not the caller: self | upstream_id |
+	// usage_content_window | backend_key_window.
 	JoinMethod string
 }
 
@@ -252,12 +258,12 @@ func (s *Store) writeOnce(ctx context.Context, ev Event) (Result, error) {
 
 	// 3. The heuristic, and only where the heuristic is honest. See lookupFallback: it returns an
 	//    empty key unless exactly one candidate qualifies.
-	candidate, err := s.lookupFallback(ctx, ev)
+	candidate, method, err := s.lookupFallback(ctx, ev)
 	if err != nil {
 		return Result{}, err
 	}
 	if candidate != "" {
-		joinOverride = ptr("backend_key_window")
+		joinOverride = ptr(method)
 		return s.upsert(ctx, ev, candidate, joinOverride, PathJoinFallback)
 	}
 
@@ -283,7 +289,8 @@ INSERT INTO call_events (
 	wait_ms, ttft_ms, total_ms, prompt_ms, decode_ms,
 	prompt_tokens, completion_tokens, cached_tokens, engine_cached_tokens,
 	prefill_tok_s, decode_tok_s, expert_cache_hit_rate,
-	usage_source, finish_reason, drafts_offered, drafts_accepted, extra, join_method
+	usage_source, finish_reason, drafts_offered, drafts_accepted, extra, join_method,
+	prompt_tokens_computed
 ) VALUES (
 	$1, $2, $3, $4, $5, $6, $7,
 	$8, $9, $10, $11, $12, $13, $14, $15,
@@ -291,7 +298,7 @@ INSERT INTO call_events (
 	$26, $27, $28, $29, $30,
 	$31, $32, $33, $34,
 	$35, $36, $37,
-	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self')
+	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self'), $44
 )
 ON CONFLICT (event_key) DO UPDATE SET
 	id                   = COALESCE(call_events.id, EXCLUDED.id),
@@ -323,6 +330,10 @@ ON CONFLICT (event_key) DO UPDATE SET
 	prompt_ms            = COALESCE(call_events.prompt_ms, EXCLUDED.prompt_ms),
 	decode_ms            = COALESCE(call_events.decode_ms, EXCLUDED.decode_ms),
 	prompt_tokens        = COALESCE(call_events.prompt_tokens, EXCLUDED.prompt_tokens),
+	-- Appended last in the column list rather than slotted in beside prompt_tokens, so the parameter
+	-- numbers of every existing fact keep their meaning. It stays its own column: the reported count is
+	-- never overwritten by a computed one, in either direction.
+	prompt_tokens_computed = COALESCE(call_events.prompt_tokens_computed, EXCLUDED.prompt_tokens_computed),
 	completion_tokens    = COALESCE(call_events.completion_tokens, EXCLUDED.completion_tokens),
 	cached_tokens        = COALESCE(call_events.cached_tokens, EXCLUDED.cached_tokens),
 	engine_cached_tokens = COALESCE(call_events.engine_cached_tokens, EXCLUDED.engine_cached_tokens),
@@ -397,7 +408,7 @@ func (s *Store) upsert(ctx context.Context, ev Event, key string, joinOverride *
 		derefOpt(ev.PromptTokens), derefOpt(ev.CompletionTokens), derefOpt(ev.CachedTokens), derefOpt(ev.EngineCachedTokens),
 		derefOpt(ev.PrefillTokS), derefOpt(ev.DecodeTokS), derefOpt(ev.ExpertCacheHitRate),
 		usageSourceOrDefault(ev.UsageSource), nullableString(ev.FinishReason), derefOpt(ev.DraftsOffered), derefOpt(ev.DraftsAccepted),
-		extra, nullableString(joinOverride),
+		extra, nullableString(joinOverride), derefOpt(ev.PromptTokensComputed),
 	)
 	if err := row.Scan(&res.EventKey, &inserted, &res.JoinMethod, &res.SourceCount, &res.HasUsage); err != nil {
 		return Result{}, fmt.Errorf("write %s: %w", key, err)
@@ -466,29 +477,55 @@ func (s *Store) lookupUpstream(ctx context.Context, upstreamID string) (string, 
 //   - same backend, and same session key where BOTH sides have one. A runner's own metrics record
 //     does not know who asked, so requiring its key to match would make this path unreachable in
 //     practice; allowing a NULL key on one side is the whole of the looseness here.
-//   - intervals overlap within FallbackWindow. NOT point proximity: measured against strata, a
-//     request record's `time` is the call's START (10 ms off the client's own start), while a
-//     router naturally stamps the call when the response ENDS. On an 11.4 s generation that is an
-//     11.5 s gap between two descriptions of one call, so a 2-second point window would never
-//     match - the fallback would sit there looking correct while joining nothing, forever.
+//   - start proximity within FallbackWindow, with each side's wait_ms added to the allowance. Both
+//     surfaces stamp the START of a call - rooter sets ts in newCallRecord ("everything here is known
+//     before a slot is even requested") and strata's record `time` was measured 10 ms from a client's
+//     own start on a call that then ran 11.4 s - so this is the discriminating timing test. Interval
+//     overlap is kept as a secondary guard, and it earned that demotion: an earlier revision used
+//     overlap INSTEAD of proximity and, against live strata, a 125.6 s envelope absorbed an unrelated
+//     4.7 s record that began two minutes later. A long interval touches a lot of work that is not
+//     yours.
 //   - source_count = 1: a row that already has two surfaces in it is not a loose end, and pulling
 //     a third into it is how one wrong guess propagates into a row that looks well attested.
-//   - upstream_id IS NULL: nothing better is available on that row.
 //   - exactly one wire witness between the two rows. A session key is a wire witness: it is a
 //     surface saying a client asked. Two rows that both have one are two calls (or they would have
 //     joined on the runner's id); two rows that both lack one are two engine records with nothing
 //     claiming they are the same work. The fallback exists to connect "a client asked" with "the
 //     engine did work", so that is exactly the pair it is allowed to merge - and without this rule,
 //     two router envelopes in one session merge into each other, which is a fabricated call.
-//   - exactly one candidate. Two candidates is a coin flip, and a coin flip is not a join.
-//     Ambiguity stays as two visibly unjoined rows that call_quality reports as unjoined.
+//   - exactly one candidate in the tier that fires. Two candidates is a coin flip, and a coin flip is
+//     not a join. Ambiguity stays as two visibly unjoined rows that call_quality reports as unjoined.
 //
-// What this path cannot do is make a runner-side record trustworthy on its own. It is a rescue for
-// abandoned streams. The permanent fix is for the runner to expose the chatcmpl id it minted, which
-// turns this into path 2 and a key that can be shown to a reader.
-func (s *Store) lookupFallback(ctx context.Context, ev Event) (string, error) {
+// Two tiers, because live traffic showed one predicate is not enough. Rooter's ring records carry the
+// runner's chatcmpl id, so a row that reaches the fallback already identified is now the COMMON case
+// rather than the odd one - and a rule that refuses every identified candidate silently joins nothing
+// while continuing to look correct. But an unidentified row is exactly where a timing guess is most
+// dangerous, because nothing on either side can say a client asked.
+//
+//   - usage_content_window (strong): both sides report prompt_tokens AND completion_tokens, and those
+//     numbers agree exactly. Live evidence that this is a real signal rather than a coincidence: 35
+//     rooter events against 12 strata records produced pairs where prompt 66933/66933, cached
+//     66509/66509 and completion 549/549 matched to the token, while total_ms differed by 450 ms
+//     because the router's number includes the router. A token triple is a content match, and content
+//     survives a clock disagreement that timing cannot.
+//   - backend_key_window (weak): the timing rule, used only when at least one side has no usage
+//     numbers - which is the abandoned-stream case this path was built for, where the engine finished
+//     work the router never got to describe. Here the candidate must ALSO have no upstream_id, so a
+//     row that already names its call cannot be re- attributed by a clock.
+//
+// And the veto that came from the same capture: when BOTH sides have usage numbers and those numbers
+// disagree, the join is refused outright rather than falling through to the weak tier. Two live cases
+// made that rule. Rooter event /32 sat -0.09 s from a strata record and matched it on timing while
+// reporting 49903 prompt tokens against that record's 66933; rooter event /40 sat -0.10 s from another
+// and reported 52922/44333 with completion 183 against 1395. Timing alone called both of them the same
+// call. A token disagreement is not a weak match, it is a different call.
+//
+// What this path cannot do is make a runner-side record trustworthy on its own. The permanent fix is
+// for the runner to expose the chatcmpl id it minted, which turns the strong tier into path 2 and a
+// key that can be shown to a reader.
+func (s *Store) lookupFallback(ctx context.Context, ev Event) (key, method string, err error) {
 	if deref(ev.Backend) == "" {
-		return "", nil
+		return "", "", nil
 	}
 	// Only worth doing when this event brings something the row cannot produce on its own: an engine
 	// measurement, or a witness that a CLIENT caused this work (a session key plus a wire status).
@@ -498,7 +535,7 @@ func (s *Store) lookupFallback(ctx context.Context, ev Event) (string, error) {
 	if derefOpt(ev.PromptTokens) == nil && derefOpt(ev.CompletionTokens) == nil &&
 		derefOpt(ev.EngineCachedTokens) == nil && derefOpt(ev.DecodeTokS) == nil &&
 		!(deref(ev.Key) != "" && derefOpt(ev.Status) != nil) {
-		return "", nil
+		return "", "", nil
 	}
 
 	// $3 is the incoming call's start, $4 its duration in ms (0 when unknown, which makes it a
@@ -512,10 +549,13 @@ func (s *Store) lookupFallback(ctx context.Context, ev Event) (string, error) {
 		wait = *ev.WaitMs
 	}
 	const q = `
-		SELECT event_key FROM call_events
+		SELECT event_key,
+		       upstream_id IS NOT NULL                       AS identified,
+		       prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL AS full_usage,
+		       prompt_tokens, completion_tokens
+		 FROM call_events
 		 WHERE backend = $1
 		   AND (($2::text IS NOT NULL AND "key" IS NULL) OR ($2::text IS NULL AND "key" IS NOT NULL))
-		   AND upstream_id IS NULL
 		   AND source_count = 1
 		   AND abs(extract(epoch from ts) - extract(epoch from $3::timestamptz))
 		       <= ($5 + coalesce(wait_ms, 0) + $6) / 1000.0
@@ -528,27 +568,60 @@ func (s *Store) lookupFallback(ctx context.Context, ev Event) (string, error) {
 	rows, err := s.db.QueryContext(ctx, q, *ev.Backend, nullableString(ev.Key), ev.TS,
 		derefOpt(ev.TotalMs), float64(FallbackWindow.Milliseconds()), wait)
 	if err != nil {
-		return "", fmt.Errorf("fallback lookup: %w", err)
+		return "", "", fmt.Errorf("fallback lookup: %w", err)
 	}
 	defer rows.Close()
 
 	var (
-		candidates []string
-		key        string
+		content, loose []string
+		cKey           string
+		cIdentified    bool
+		cFullUsage     bool
+		cPrompt        *int64
+		cCompletion    *int64
 	)
 	for rows.Next() {
-		if err := rows.Scan(&key); err != nil {
-			return "", fmt.Errorf("fallback lookup scan: %w", err)
+		if err := rows.Scan(&cKey, &cIdentified, &cFullUsage, &cPrompt, &cCompletion); err != nil {
+			return "", "", fmt.Errorf("fallback lookup scan: %w", err)
 		}
-		candidates = append(candidates, key)
+		// Content tier: numbers have to agree on every quantity both sides actually measured.
+		if cFullUsage && ev.PromptTokens != nil && ev.CompletionTokens != nil &&
+			*cPrompt == *ev.PromptTokens && *cCompletion == *ev.CompletionTokens {
+			content = append(content, cKey)
+			continue
+		}
+		// The veto. Both sides measured prompt and completion tokens and those measurements disagree:
+		// that is a different call, not a weak match, and no amount of clock proximity gets to say
+		// otherwise. Falling through to the weak tier here is what produced two live false positives.
+		if cFullUsage && ev.PromptTokens != nil && ev.CompletionTokens != nil {
+			continue
+		}
+		// Weak tier: only for candidates nobody has identified yet. A row that already carries the
+		// runner's chatcmpl id is the most trusted kind of row this store has, and attaching numbers to
+		// it on a clock agreement is how a wrong measurement acquires the authority of an id. Those rows
+		// take engine numbers through the content tier or not at all.
+		if !cIdentified {
+			loose = append(loose, cKey)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("fallback lookup rows: %w", err)
+		return "", "", fmt.Errorf("fallback lookup rows: %w", err)
 	}
-	if len(candidates) != 1 {
-		return "", nil
+
+	switch {
+	case len(content) == 1:
+		return content[0], "usage_content_window", nil
+	case len(content) > 1:
+		// Ambiguity in the strong tier vetoes the whole lookup, including the weak tier. Two rows that
+		// both look like this call is precisely the situation a weaker rule cannot resolve.
+		return "", "", nil
+	case len(loose) == 1:
+		return loose[0], "backend_key_window", nil
+	default:
+		// Either no candidate survived classification (two measurements that disagree, or every
+		// candidate is already identified), or more than one did. Both mean: do not guess.
+		return "", "", nil
 	}
-	return candidates[0], nil
 }
 
 func validate(ev Event) error {
