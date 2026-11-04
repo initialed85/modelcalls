@@ -1,0 +1,64 @@
+# Contract lane for modelcalls: prove the store's dedup and join rules on a real Postgres 16.
+#
+# The value of this store IS Postgres semantics - a partial UNIQUE index that makes a cross-surface
+# sighting collide instead of duplicate, ON CONFLICT merge arithmetic that fills gaps without
+# overwriting facts, a generated column no writer can argue with, jsonb concatenation that keeps
+# each surface's evidence under its own name. A test against a fake database would verify my
+# Go code and none of the contract, so this lane starts a real Postgres as a service and runs both
+# halves of the same contract against it:
+#
+#   sql-contract  test/contract_scenarios.sql   the protocol as Postgres sees it
+#   go-contract   internal/store                the same protocol through the production write path
+#
+# The two halves caught each other once already, on the first run: a Go usage_source vocabulary the
+# schema's CHECK rejected, and an `extra` merge in which two surfaces both writing "raw" would have
+# silently replaced one another's evidence. That is the reason both exist rather than one.
+#
+# No publish and no deploy here yet: the store has nothing to run until the harvester and the
+# home-dev Postgres land, and shipping a container that writes to a database nobody has provisioned
+# would just be a way to be wrong in more places.
+services:
+  - name: postgres
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_USER: mc
+      POSTGRES_PASSWORD: mc
+      POSTGRES_DB: modelcalls
+
+steps:
+  - name: sql-contract
+    image: docker.io/library/postgres:16
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: mc
+      PGPASSWORD: mc
+      PGDATABASE: modelcalls
+    commands:
+      # A service container is not a started database. Bounded, because a lane that waits forever
+      # looks identical to a lane that is merely slow.
+      - for i in $(seq 1 60); do pg_isready -h postgres -U mc -d modelcalls && break; sleep 1; done
+      - pg_isready -h postgres -U mc -d modelcalls
+      - psql -v ON_ERROR_STOP=1 -f migrations/001_initial.sql
+      - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
+
+  - name: go-contract
+    image: docker.io/library/golang:1.24
+    depends_on: [sql-contract]
+    environment:
+      # sslmode=disable because this is a service network inside one pipeline, not a network we
+      # control. A store DSN that cannot be satisfied by the environment it runs in is a store
+      # nobody can deploy.
+      MODELCALLS_TEST_DSN: postgres://mc:mc@postgres:5432/modelcalls?sslmode=disable
+    commands:
+      - go version
+      # go.mod says 1.24 and the image says 1.24. A build gate that resolves a different Go than
+      # the module targets is a gate on a different program.
+      - go mod verify
+      - go vet ./...
+      - go test -count=1 ./...
+
+when:
+  - event: push
+    branch: master
+  - event: pull_request
