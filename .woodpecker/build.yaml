@@ -106,6 +106,15 @@ steps:
       - ./entrypoint -migrate-only -dsn "$DSN"
       - psql -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM call_events"
 
+  # `privileged: true` is what a dind build needs on this backend, and it is gated: Woodpecker's linter
+  # rejects it before anything is scheduled unless the repository is trusted for `security`
+  # (linter.go:lintTrusted reads Trusted.Security). Measured on this repo's first pipeline - it landed in
+  # `error` with zero steps, and the only trace was the `errors` column of the `pipelines` row:
+  # {"type":"linter","message":"Insufficient trust level to use `privileged` mode",
+  #  "data":{"file":"build","field":"steps.build-and-push"}}.
+  # Nothing in a pod log, nothing in the badge beyond "error", and `hack/check-woodpecker-config.py`
+  # reports the same verdict only when run with the trust flags this repo actually has. The flag is set
+  # per repo, not per workflow, so this comment is the only place the requirement is written down.
   - name: build-and-push
     image: docker.io/library/docker:cli
     privileged: true
