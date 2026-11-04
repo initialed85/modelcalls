@@ -179,8 +179,12 @@ the code is doing something the schema never promised.
 docker run -d --name mc-pg -e POSTGRES_USER=mc -e POSTGRES_PASSWORD=mc \
   -e POSTGRES_DB=modelcalls -p 127.0.0.1:15432:5432 postgres:16
 
-docker exec -i mc-pg psql -U mc -d modelcalls -v ON_ERROR_STOP=1 \
-  -f migrations/001_initial.sql           # then -f test/contract_scenarios.sql
+# Migrations in name order; the binary does this itself on boot, so doing it by hand is for the
+# moment before a binary exists.
+for f in internal/store/migrations/*.sql; do
+  docker exec -i mc-pg psql -U mc -d modelcalls -v ON_ERROR_STOP=1 -f "$f"
+done
+docker exec -i mc-pg psql -U mc -d modelcalls -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
 
 MODELCALLS_TEST_DSN='postgres://mc:mc@127.0.0.1:15432/modelcalls?sslmode=disable' \
   go test ./...
@@ -189,10 +193,42 @@ MODELCALLS_TEST_DSN='postgres://mc:mc@127.0.0.1:15432/modelcalls?sslmode=disable
 A real Postgres 16 is required. The contract *is* Postgres — partial unique indexes, `ON CONFLICT`
 merge arithmetic, generated columns, jsonb concatenation — and there is no useful version of this
 against a fake database. [Woodpecker CI](https://woodpecker.dev.initialed85.cc/initialed85/modelcalls)
-runs both halves against a `postgres:16` service on every push.
+runs both halves against a `postgres:16` service on every push, applies the migrations **twice**,
+applies the scenarios **twice**, and then drops the whole schema and rebuilds it with the compiled
+binary (`./entrypoint -migrate-only`) before it is allowed to publish anything. Re-runnability is not
+a claim this repo makes in a comment; a Deployment applies these migrations on every start, so a
+migration that only works once is a rollout that crashes on the second boot.
 
-## Not built yet
+## Deployed
 
-The harvester that reads rooter's event ring and the runners' surfaces, the probe that tails sushi's
-log, and the Postgres this all writes to in home-dev. Publishing a container that writes to a
-database nobody has provisioned would only be a way to be wrong in more places.
+`home-dev`, namespace `modelcalls`, reconciled by Argo from `home-ops/clusters/dev/applications/modelcalls`:
+
+| piece | what it is |
+|---|---|
+| `modelcalls-postgres` | Postgres 16 pinned by digest, 2 GiB Longhorn volume, ClusterIP only — nothing outside the namespace writes to the store except the harvester |
+| `modelcalls-harvester` | one pod, `Recreate`, polls strata's `/metrics` on the GPU host and rooter's in-cluster Service every 10s, serves `/healthz` and `/metrics` on `:9138` |
+
+The harvester carries its schema. `internal/store/migrate.go` embeds the migration files and applies
+them on every boot, so the database a pod writes against is the database its code was written for —
+a schema applied by something else can lag a binary quietly, where the writes keep succeeding and the
+new facts simply never arrive. `-migrate=false` is there for the case where the database really is
+owned elsewhere.
+
+`/metrics` publishes the store's own account of itself, read out of `call_quality`: totals plus a
+per-backend breakdown of `modelcalls_calls_with_usage`, `calls_without_usage`, `calls_aborted`,
+`calls_joined_by_content`, `calls_joined_by_timing_only`, `calls_with_undefined_cache_rate`,
+`calls_with_observed_ts`, alongside `modelcalls_harvest_*` for what this process did (cycles, the last
+cycle's timestamp, the last error text, and a tally per write path). vmagent already scrapes any pod
+carrying `prometheus.io/scrape`, so these land in VictoriaMetrics with no scrape config to maintain.
+The split matters: a harvester polling a router that has gone quiet looks healthy until you ask how
+many rows it actually wrote today.
+
+**Still missing, and it is someone else's code:** rooter's `/rooter/events` and
+`strata-exporter`'s `/events` are 404 in the images currently deployed (measured from inside a pod).
+The harvester is pointed at rooter's ring anyway, so it logs the 404 every cycle and keeps capturing
+strata rather than shipping half a picture. Capture becomes two-sided the moment those endpoints land,
+with no manifest change needed.
+
+Panels are not built. The store is the layer that can answer the questions; deciding which questions
+deserve a graph is a separate job, and doing it before the data has been accumulating for a week would
+be designing a dashboard off a sample of an afternoon.

@@ -1,0 +1,163 @@
+# Build, publish, and deploy modelcalls (home-dev, namespace `modelcalls`).
+#
+# This is the contract lane from `.woodpecker/contract.yaml` (git history keeps that name) with a
+# publish and a deploy bolted on, rather than a second lane next to it. Two lanes on the same trigger
+# would run the same contract twice per push and double the Postgres services; one lane with
+# publish/deploy gated on `when: event: push` keeps the pull_request case free of side effects, which
+# is what a PR should be: proof, no shipping.
+#
+# The contract halves stay in this order on purpose. `sql-contract` asks Postgres what the schema does;
+# `go-contract` asks the production write path the same questions through Go. They have disagreed
+# before - a usage_source vocabulary the CHECK rejected, an `extra` merge that overwrote one surface's
+# evidence with another's - and the disagreement is the value.
+#
+# Migrations run twice here, in order, because that is what a Deployment does to a database: boot,
+# rollout, node reboot. 001 alone is only the fresh-install story - its CREATE TABLE IF NOT EXISTS
+# means an existing call_events keeps whatever join_method CHECK it already had, which is exactly the
+# trap 002 exists to escape.
+#
+# `migrate-smoke` then runs the SHIPPED artifact against the same database from an empty schema. It is
+# the step that connects the schema to the image: the binary carries its migrations (internal/store/
+# migrate.go), so the store a pod can bring up is proved by the same bytes that get pushed to the
+# registry, not by a psql invocation that only CI ever runs.
+services:
+  - name: postgres
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_USER: mc
+      POSTGRES_PASSWORD: mc
+      POSTGRES_DB: modelcalls
+
+steps:
+  - name: sql-contract
+    image: docker.io/library/postgres:16
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: mc
+      PGPASSWORD: mc
+      PGDATABASE: modelcalls
+    commands:
+      # A service container is not a started database. Bounded, because a lane that waits forever looks
+      # identical to a lane that is merely slow.
+      - for i in $(seq 1 60); do pg_isready -h postgres -U mc -d modelcalls && break; sleep 1; done
+      - pg_isready -h postgres -U mc -d modelcalls
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
+      # Second pass over the same database. Every migration in this repo claims to be safe to re-apply;
+      # this is where that claim is tested rather than asserted in a comment.
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
+      # The scenarios twice as well: they assert the contract from a known state, and half of them are
+      # "this statement must fail", which is only meaningful if it still fails on a database that has
+      # already been through them.
+      - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
+      - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
+
+  - name: go-contract
+    image: docker.io/library/golang:1.24
+    depends_on: [sql-contract]
+    environment:
+      # sslmode=disable because this is a service network inside one pipeline, not a network we
+      # control. A store DSN that cannot be satisfied by the environment it runs in is a store nobody
+      # can deploy.
+      MODELCALLS_TEST_DSN: postgres://mc:mc@postgres:5432/modelcalls?sslmode=disable
+    commands:
+      - go version
+      # go.mod says 1.24 and the image says 1.24. A build gate that resolves a different Go than the
+      # module targets is a gate on a different program.
+      - go mod verify
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "FATAL gofmt - commit the output of gofmt -w ."; exit 1; }
+      - go vet ./...
+      - go test -count=1 ./...
+
+  - name: compile-binary
+    image: docker.io/library/golang:1.24
+    depends_on: [go-contract]
+    commands:
+      - env GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -v -trimpath -o ./entrypoint ./cmd/mcharvest
+      - ls -l ./entrypoint
+
+  # The artifact is tested against the database before it is shipped, and against the artifact the
+  # tests ran against before it is built. Both directions matter: the image ships these bytes, and
+  # these bytes are what brings a production store into existence.
+  - name: migrate-smoke
+    image: docker.io/library/postgres:16
+    depends_on: [compile-binary]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: mc
+      PGPASSWORD: mc
+      PGDATABASE: modelcalls
+      DSN: postgres://mc:mc@postgres:5432/modelcalls?sslmode=disable
+    commands:
+      # From nothing: drop the schema the earlier steps built, then let the binary rebuild it. If a
+      # migration were only valid against a schema CI happened to already have, this is where it fails.
+      - psql -v ON_ERROR_STOP=1 -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+      - ./entrypoint -migrate-only -dsn "$DSN"
+      - psql -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM call_events"
+      - psql -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM calls"
+      - psql -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM call_quality"
+      # And again, because the pod runs it on every start: a second pass is the deploy behaviour, not an
+      # edge case.
+      - ./entrypoint -migrate-only -dsn "$DSN"
+      - psql -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM call_events"
+
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    depends_on: [migrate-smoke]
+    # docker.io/library/golang is already used for the tests, and ubuntu:26.04 is the base
+    # strata_exporter and rooter build against, so this node has both warm. Pinning one node is also
+    # what keeps a build from pulling a 30 MB base image on a machine that has never seen it.
+    environment:
+      DOCKER_HOST: tcp://docker-ocnus-ci-2:2375
+      IMAGE: docker.io/initialed85/modelcalls
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      - docker build --pull --progress=plain --platform=linux/amd64 -f docker/Dockerfile -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker inspect --format 'digests={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+    when:
+      - event: push
+
+  - name: deploy-home-ops
+    image: docker.io/initialed85/wp-kustomize-deploy:latest
+    depends_on: [build-and-push]
+    settings:
+      image: docker.io/initialed85/modelcalls
+      dir: clusters/dev/applications/modelcalls
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: home-ops-deploy-key
+            key: id_ed25519
+            target:
+              env: PLUGIN_DEPLOY_KEY
+          - name: home-ops-deploy-key
+            key: known_hosts
+            target:
+              env: PLUGIN_KNOWN_HOSTS
+    when:
+      - event: push
+
+when:
+  - event: push
+    branch: master
+  - event: pull_request

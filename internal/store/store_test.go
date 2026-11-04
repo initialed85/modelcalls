@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"math"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -110,23 +108,17 @@ func setup(t *testing.T) (context.Context, *store.Store) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	// Migrations first (each is idempotent), in name order, then a truncate: the contract is only
-	// meaningful from a known empty state, and a fresh database has nothing to truncate. Name order
-	// rather than one hardcoded file, because a test harness that applies only 001 never executes the
-	// upgrade path - and the upgrade path is where 002's reason for existing lives.
-	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
-	if err != nil || len(files) == 0 {
-		t.Fatalf("find migrations: %v", err)
+	// The binary's own migration path first, then a truncate: the contract is only meaningful from a
+	// known empty state, and a fresh database has nothing to truncate. Going through MigrateLatest
+	// rather than reading files off disk means the tests run against exactly the schema a deployed
+	// pod brings its database up to, and a harness that applied only 001 would never execute the
+	// upgrade path - which is where 002's reason for existing lives.
+	applied, err := st.MigrateLatest(ctx)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
-	sort.Strings(files)
-	for _, name := range files {
-		sqlBytes, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatalf("read migration %s: %v", name, err)
-		}
-		if err := st.Migrate(ctx, sqlBytes); err != nil {
-			t.Fatalf("migrate %s: %v", filepath.Base(name), err)
-		}
+	if len(applied) == 0 {
+		t.Fatalf("MigrateLatest applied nothing")
 	}
 	if _, err := st.DB().ExecContext(ctx, "TRUNCATE TABLE call_events"); err != nil {
 		t.Fatalf("truncate: %v", err)

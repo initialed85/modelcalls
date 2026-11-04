@@ -18,10 +18,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/initialed85/modelcalls/internal/sources"
@@ -44,14 +47,17 @@ func main() {
 		rooterToken = flag.String("rooter-token", envOr("ROOTER_API_KEY", ""), "bearer token for rooter's /rooter/events")
 		rooterLimit = flag.Int("rooter-limit", 200, "records per rooter poll")
 
-		maxCycles = flag.Int("cycles", 0, "stop after this many cycles (0 runs until interrupted)")
+		maxCycles   = flag.Int("cycles", 0, "stop after this many cycles (0 runs until interrupted)")
+		listen      = flag.String("listen", envOr("MODELCALLS_LISTEN", ""), "serve /healthz and /metrics on this address (empty serves nothing)")
+		migrate     = flag.Bool("migrate", envOrBool("MODELCALLS_MIGRATE", true), "apply the embedded migrations on boot (0 runs each, so this is safe on every start)")
+		migrateOnly = flag.Bool("migrate-only", false, "bring the store up to the embedded schema and exit, without polling anything")
 	)
 	flag.Parse()
 
 	if *dsn == "" {
 		log.Fatal("-dsn (or MODELCALLS_DSN) is required: the store is not optional")
 	}
-	if *strataURL == "" && *rooterURL == "" {
+	if *strataURL == "" && *rooterURL == "" && !*migrateOnly {
 		log.Fatal("nothing to poll: set -strata-url and/or -rooter-url")
 	}
 
@@ -64,6 +70,25 @@ func main() {
 	}
 	defer st.Close()
 
+	// The binary carries its own schema, so a deployed pod writes against the schema its code was
+	// written for instead of whatever a human remembered to apply. -migrate=false is there for the case
+	// where the database is owned by something else (a managed Postgres, a restore being verified).
+	if *migrate || *migrateOnly {
+		applied, err := st.MigrateLatest(ctx)
+		if err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+		log.Printf("store schema: applied %s", strings.Join(applied, ", "))
+	}
+	if *migrateOnly {
+		// A deploy step, not a harvester run: this is how a first deploy proves the binary can bring a
+		// store up from nothing, and how a CI lane can assert it without inventing a fake source to
+		// poll. The schema travels with the binary, so the thing being verified is the artifact that
+		// gets shipped.
+		fmt.Println("modelcalls migrate done")
+		return
+	}
+
 	var strata *sources.Strata
 	if *strataURL != "" {
 		strata = &sources.Strata{URL: *strataURL, Token: *strataToken,
@@ -75,12 +100,23 @@ func main() {
 	}
 
 	counts := map[string]int{}
+	snap := &snapshot{}
+	srv, err := startHealth(*listen, st, snap)
+	if err != nil {
+		log.Fatalf("health listener: %v", err)
+	}
+	if srv != nil {
+		defer srv.Close()
+	}
+
 	for cycle := 1; ; cycle++ {
-		if err := pass(ctx, st, rooter, strata, counts); err != nil {
+		err := pass(ctx, st, rooter, strata, counts)
+		if err != nil {
 			// One source being down does not stop the other. A router that is restarting is not a
 			// reason to stop recording what the engine said about the calls it did serve.
 			log.Printf("cycle %d: %v", cycle, err)
 		}
+		snap.cycle(err, counts)
 		if *once || (*maxCycles > 0 && cycle >= *maxCycles) {
 			break
 		}
@@ -130,7 +166,9 @@ func pass(ctx context.Context, st *store.Store, rooter *sources.Rooter, strata *
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("%d problem(s): %v", len(errs), errs[0])
+		// Every problem, not the first one: a cycle that failed on two sources reports one failure,
+		// and whoever is reading the log then debugs the wrong source.
+		return fmt.Errorf("%d problem(s): %w", len(errs), errors.Join(errs...))
 	}
 	if n := counts[store.PathUnattributed]; n > 0 {
 		log.Printf("cycle: %s - engine records with no client behind them were reported and NOT written; "+
@@ -177,6 +215,21 @@ func summary(counts map[string]int) string {
 		return "nothing new"
 	}
 	return out
+}
+
+// envOrBool reads a boolean env var, with the flag's default as the fallback. -migrate defaults to on
+// precisely because the default has to be the deployed behaviour; a manifest that has to remember to
+// turn the schema migration on is a manifest that eventually forgets.
+func envOrBool(k string, fallback bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }
 
 func envOr(k, fallback string) string {
