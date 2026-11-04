@@ -17,9 +17,14 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 	rows := []storeRow{
 		{Backend: "strata", Calls: 58, CallsWithUsage: 56, CallsWithoutUsage: 2, CallsAborted: 1,
 			CallsJoinedAcrossSurfaces: 9, CallsWithUpstreamID: 54, CallsJoinedByContent: 9,
-			CallsWithUndefinedCacheRate: 0, CallsWithExpertCacheRate: 12},
+			CallsWithUndefinedCacheRate: 0, CallsWithExpertCacheRate: 12,
+			CallsWithFirstContentMs: 30, CallsWithFirstContentGap: 29, CallsWithNegativeFirstContentGap: 1,
+			MeanTTFTMs: f64(140.5), MeanFirstContentMs: f64(30456.4), MeanFirstContentGap: f64(30315.9)},
+		// Sushi has no first-content measurement at all, which is the state worth testing: a mean over
+		// nothing must not be published as 0, because 0 is the number a panel reads as "no thinking".
 		{Backend: "sushi", Calls: 12, CallsWithUsage: 12, CallsWithObservedTS: 0,
-			CallsJoinedAcrossSurfaces: 2, CallsWithUpstreamID: 12, CallsJoinedByTimingOnly: 2},
+			CallsJoinedAcrossSurfaces: 2, CallsWithUpstreamID: 12, CallsJoinedByTimingOnly: 2,
+			CallsWithFirstContentMs: 0, CallsWithFirstContentGap: 0},
 	}
 	counts := map[string]int{"insert": 40, "re_pull": 20, "unattributed": 1}
 	text := renderMetrics(rows, 7, time.Unix(1793761423, 0).UTC(), "", counts)
@@ -37,6 +42,11 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 		`modelcalls_calls_total{backend="strata"} 58`,
 		`modelcalls_calls_joined_by_timing_only{backend="sushi"} 2`,
 		`modelcalls_calls_with_expert_cache_rate{backend="strata"} 12`,
+		// The thinking gap's population, so no mean over it can be read without the denominator.
+		"modelcalls_calls_with_first_content_gap 29",
+		`modelcalls_calls_with_first_content_gap{backend="sushi"} 0`,
+		`modelcalls_call_mean_first_content_gap_ms{backend="strata"} 30315.900000`,
+		`modelcalls_call_mean_ttft_ms{backend="strata"} 140.500000`,
 		"modelcalls_harvest_cycles_total 7",
 		"modelcalls_harvest_last_cycle_timestamp_seconds 1793761423",
 		"modelcalls_harvest_last_cycle_ok 1",
@@ -50,8 +60,9 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 	}
 
 	// Every data line has to be parseable, because a single malformed line makes the whole scrape fail
-	// and the panel goes "no data" rather than "wrong data".
-	line := regexp.MustCompile(`^[a-z_]+(\{[a-z_]+="[^"]*"\})? [-0-9]+$`)
+	// and the panel goes "no data" rather than "wrong data". Floats are allowed because the timing means
+	// are seconds-to-microsecond quantities and truncating them to integers would be a lie of its own.
+	line := regexp.MustCompile(`^[a-z_]+(\{[a-z_]+="[^"]*"\})? [-0-9]+(\.[0-9]+)?$`)
 	for i, l := range strings.Split(strings.TrimSpace(text), "\n") {
 		if strings.HasPrefix(l, "#") {
 			continue
@@ -60,6 +71,25 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 			t.Errorf("line %d is not a valid exposition line: %q", i+1, l)
 		}
 	}
+
+	t.Run("a mean is only published where there is a population to mean", func(t *testing.T) {
+		// Sushi reported nothing for first_content_ms, so it must not have a series: the scrape that
+		// shows 0 for a box nobody measured is the scrape that makes an absence look like a result.
+		if strings.Contains(text, `modelcalls_call_mean_first_content_gap_ms{backend="sushi"}`) {
+			t.Error("a mean was published for a backend with no first-content rows, so the panel averages a number that is not there")
+		}
+		if strings.Contains(text, `modelcalls_call_mean_ttft_ms{backend="sushi"}`) {
+			t.Error("a mean was published for a backend with no measurement")
+		}
+		// And no unlabelled version of any mean exists: the mean of two per-backend means is not the
+		// mean over the calls, and averaging a box that served 60 calls with one that served 3 is a
+		// number about neither.
+		for _, m := range []string{"call_mean_ttft_ms", "call_mean_first_content_ms", "call_mean_first_content_gap_ms"} {
+			if strings.Contains(text, "\nmodelcalls_"+m+" ") {
+				t.Errorf("modelcalls_%s is published without a backend label; a total of per-backend means is not a mean over calls", m)
+			}
+		}
+	})
 
 	t.Run("a failing cycle is visible", func(t *testing.T) {
 		bad := renderMetrics(rows, 8, time.Unix(1793761500, 0).UTC(), "rooter: 404 Not Found", counts)
@@ -154,3 +184,5 @@ func TestReadCallQualityMatchesTheView(t *testing.T) {
 		}
 	}
 }
+
+func f64(v float64) *float64 { return &v }

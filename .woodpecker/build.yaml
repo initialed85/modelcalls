@@ -45,16 +45,30 @@ steps:
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/004_first_content.sql
       # Second pass over the same database. Every migration in this repo claims to be safe to re-apply;
       # this is where that claim is tested rather than asserted in a comment.
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
       - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
+      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/004_first_content.sql
       # The scenarios twice as well: they assert the contract from a known state, and half of them are
       # "this statement must fail", which is only meaningful if it still fails on a database that has
       # already been through them.
       - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
       - psql -v ON_ERROR_STOP=1 -f test/contract_scenarios.sql
+      # The path every other step in this lane skips: a database that was created by an OLD schema and
+      # has been upgraded in place. It runs in its own database because it is the only step here that
+      # starts by dropping the schema, and the Go tests that follow expect the store this lane built.
+      #
+      # This is not a hypothetical. The first column added to the `calls` view in the middle of its
+      # select list passed every step above and then failed at boot on a store that had been running for
+      # a day, because CREATE OR REPLACE VIEW refuses to move an existing column and the harvester
+      # migrates before it serves. Two columns have since been found in that position; the lane is where
+      # the next one stops.
+      - psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS modelcalls_upgrade"
+      - psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE modelcalls_upgrade"
+      - psql -v ON_ERROR_STOP=1 -d modelcalls_upgrade -f test/legacy_upgrade_path.sql
 
   - name: go-contract
     image: docker.io/library/golang:1.24

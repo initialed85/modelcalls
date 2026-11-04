@@ -83,13 +83,27 @@ type storeRow struct {
 	CallsJoinedByTimingOnly     int64
 	CallsWithUndefinedCacheRate int64
 	CallsWithExpertCacheRate    int64
+
+	CallsWithFirstContentMs          int64
+	CallsWithFirstContentGap         int64
+	CallsWithNegativeFirstContentGap int64
+
+	// Means, per backend, and deliberately not summed. The mean of two per-backend means is not the
+	// mean over the calls, and publishing it under an unlabelled name is how a panel ends up averaging
+	// 60 calls from one box with 3 from another as if they were one population. The counts above are
+	// what say how many rows each mean was taken from.
+	MeanTTFTMs          *float64
+	MeanFirstContentMs  *float64
+	MeanFirstContentGap *float64
 }
 
 func (r *storeRow) fields() []any {
 	return []any{&r.Backend, &r.Calls, &r.CallsWithUsage, &r.CallsWithoutUsage, &r.CallsAborted,
 		&r.CallsWithUsageInjected, &r.CallsWithObservedTS, &r.CallsJoinedAcrossSurfaces,
 		&r.CallsWithUpstreamID, &r.CallsJoinedByContent, &r.CallsJoinedByTimingOnly,
-		&r.CallsWithUndefinedCacheRate, &r.CallsWithExpertCacheRate}
+		&r.CallsWithUndefinedCacheRate, &r.CallsWithExpertCacheRate,
+		&r.CallsWithFirstContentMs, &r.CallsWithFirstContentGap, &r.CallsWithNegativeFirstContentGap,
+		&r.MeanTTFTMs, &r.MeanFirstContentMs, &r.MeanFirstContentGap}
 }
 
 // readCallQuality names the view's columns explicitly rather than SELECT *. A wildcard would let a
@@ -99,7 +113,9 @@ func readCallQuality(ctx context.Context, db *sql.DB) ([]storeRow, error) {
 	rows, err := db.QueryContext(ctx, `SELECT backend, calls, calls_with_usage, calls_without_usage,
 		calls_aborted, calls_with_usage_injected, calls_with_observed_ts, calls_joined_across_surfaces,
 		calls_with_upstream_id, calls_joined_by_content, calls_joined_by_timing_only,
-		calls_with_undefined_cache_rate, calls_with_expert_cache_rate
+		calls_with_undefined_cache_rate, calls_with_expert_cache_rate,
+		calls_with_first_content_ms, calls_with_first_content_gap, calls_with_negative_first_content_gap,
+		mean_ttft_ms, mean_first_content_ms, mean_first_content_gap_ms
 		FROM call_quality ORDER BY backend`)
 	if err != nil {
 		return nil, err
@@ -133,6 +149,11 @@ func total(rows []storeRow) storeRow {
 		t.CallsJoinedByTimingOnly += r.CallsJoinedByTimingOnly
 		t.CallsWithUndefinedCacheRate += r.CallsWithUndefinedCacheRate
 		t.CallsWithExpertCacheRate += r.CallsWithExpertCacheRate
+		t.CallsWithFirstContentMs += r.CallsWithFirstContentMs
+		t.CallsWithFirstContentGap += r.CallsWithFirstContentGap
+		t.CallsWithNegativeFirstContentGap += r.CallsWithNegativeFirstContentGap
+		// No mean is summed here, and that is the point: a total of means is a different quantity than
+		// a mean over rows, and the per-backend series are the ones that mean something.
 	}
 	return t
 }
@@ -159,6 +180,9 @@ var storeMetrics = []storeMetric{
 	{"calls_with_upstream_id", "Rows carrying a runner-assigned id.", func(r storeRow) int64 { return r.CallsWithUpstreamID }},
 	{"calls_with_undefined_cache_rate", "Rows whose cache rate is NULL because the components cannot produce one.", func(r storeRow) int64 { return r.CallsWithUndefinedCacheRate }},
 	{"calls_with_expert_cache_rate", "Rows carrying the engine's expert-cache rate.", func(r storeRow) int64 { return r.CallsWithExpertCacheRate }},
+	{"calls_with_first_content_ms", "Rows with a first-content-token measurement at all. A mean over the gap is only honest next to this.", func(r storeRow) int64 { return r.CallsWithFirstContentMs }},
+	{"calls_with_first_content_gap", "Rows where BOTH halves of the thinking gap exist, i.e. the population any mean gap is taken from.", func(r storeRow) int64 { return r.CallsWithFirstContentGap }},
+	{"calls_with_negative_first_content_gap", "Rows where content was recorded BEFORE the first byte. A contradiction in one observer's clock, counted rather than rejected.", func(r storeRow) int64 { return r.CallsWithNegativeFirstContentGap }},
 }
 
 // renderMetrics is the whole exposition, built as text so a test can assert on it without a scraper.
@@ -189,6 +213,26 @@ func renderMetrics(rows []storeRow, cycles int, lastCycle time.Time, lastError s
 	gauge("harvest_last_cycle_ok", "1 when the last cycle completed without an error, 0 otherwise.", boolInt(lastError == ""))
 	if lastError != "" {
 		fmt.Fprintf(&b, "# TYPE modelcalls_harvest_last_error_info gauge\nmodelcalls_harvest_last_error_info{error=%q} 1\n", lastError)
+	}
+
+	// The thinking gap, per backend, and only per backend. ttft_ms is the first byte of a response;
+	// first_content_ms is the first token of content; the gap between them is what a reasoning model
+	// spends before anything on a dashboard changes. No unlabelled total is emitted: summing or
+	// averaging per-backend means produces a number that is not the mean over the calls, and the counts
+	// above are what make each mean's population visible.
+	floatGauge := func(name, backend string, v *float64) {
+		if v == nil {
+			return
+		}
+		fmt.Fprintf(&b, "# TYPE modelcalls_%s gauge\nmodelcalls_%s{backend=%q} %.6f\n", name, name, backend, *v)
+	}
+	b.WriteString("# HELP modelcalls_call_mean_ttft_ms Mean time to the first byte of a response, over the rows that measured it. On its own this is the number that reports a healthy box during a call that spent half a minute thinking; read it against modelcalls_call_mean_first_content_ms.\n")
+	b.WriteString("# HELP modelcalls_call_mean_first_content_ms Mean time to the first CONTENT token, over the rows that measured it.\n")
+	b.WriteString("# HELP modelcalls_call_mean_first_content_gap_ms Mean of (first content - first byte), per backend, over the rows where both halves were measured. Per backend only: a mean of per-backend means is not a mean over calls, and modelcalls_calls_with_first_content_gap says how many rows each one is a mean of.\n")
+	for _, r := range rows {
+		floatGauge("call_mean_ttft_ms", r.Backend, r.MeanTTFTMs)
+		floatGauge("call_mean_first_content_ms", r.Backend, r.MeanFirstContentMs)
+		floatGauge("call_mean_first_content_gap_ms", r.Backend, r.MeanFirstContentGap)
 	}
 
 	// Per-path tallies, sorted so the exposition is stable and a diff of two scrapes means something.

@@ -45,13 +45,13 @@ END $$;
 INSERT INTO call_events (
 	event_key, source, source_ids, id, upstream_id, ts, backend, backend_url, alias, profile,
 	model, model_requested, kind, "key", key_source, path, method, stream, status, bytes,
-	aborted, wait_ms, ttft_ms, total_ms, prompt_tokens, completion_tokens, cached_tokens,
+	aborted, wait_ms, ttft_ms, first_content_ms, total_ms, prompt_tokens, completion_tokens, cached_tokens,
 	cache_hit_rate, usage_source, finish_reason, extra
 ) VALUES (
 	'rooter|r-1001', 'rooter', '{rooter|r-1001}', 'r-1001', 'chatcmpl-aaa',
 	'2026-11-04T09:00:00Z', 'strata', 'http://192.168.11.128:8088', 'strata', 'iq3_xxs',
 	'qwen3.8-flash-next-iq3_xxs', 'auto', 'gen', 'pi-code', 'header', '/v1/chat/completions',
-	'POST', true, 200, 98213, false, 3.2, 640.0, 10442.4, 106718, 700, 106677, 0.999616,
+	'POST', true, 200, 98213, false, 3.2, 640.0, 1290.5, 10442.4, 106718, 700, 106677, 0.999616,
 	'injected', 'stop', '{"rooter": {"raw": {"usage": {"prompt_tokens": 106718}}}}'::jsonb
 );
 
@@ -67,6 +67,10 @@ INSERT INTO call_events (
 	'2026-11-04T09:00:00Z', 'strata', 200, 98213, false, 3.2, 640.0, 10442.4, 'injected'
 ) ON CONFLICT (event_key) DO UPDATE SET
 	ttft_ms      = COALESCE(EXCLUDED.ttft_ms, call_events.ttft_ms),
+	-- A re-pull that carries no first-content measurement must not erase the one already there. This is
+	-- the shape the thinking gap is lost in: the surface that measured it is not the surface that
+	-- reports the call again.
+	first_content_ms = COALESCE(call_events.first_content_ms, EXCLUDED.first_content_ms),
 	bytes        = COALESCE(EXCLUDED.bytes, call_events.bytes),
 	wait_ms      = COALESCE(EXCLUDED.wait_ms, call_events.wait_ms),
 	status       = COALESCE(EXCLUDED.status, call_events.status),
@@ -575,6 +579,82 @@ BEGIN
 	END IF;
 
 	RAISE NOTICE 'rates: expert rate cannot be smuggled into a prompt-reuse column, an unsourced rate is rejected, a rate follows its own components';
+END $$;
+
+-- ══ J. the thinking gap is Postgres's to compute, and nobody else's to write ══════════
+--
+-- ttft_ms is the first byte of a response; first_content_ms is the first token of content. On a
+-- reasoning model they are seconds apart (measured on rooter's live ring: ttft 2350.2ms with the first
+-- content token at 32666.1ms), and the difference is the number that says a box was busy while nothing
+-- had failed. Three properties are worth testing rather than trusting:
+--
+--   1. an unknown gap is NULL, not 0;
+--   2. it appears by itself when the missing half arrives later;
+--   3. no writer can supply it.
+DO $$
+DECLARE
+	gap double precision;
+	ttft double precision;
+	fc double precision;
+	msg text;
+BEGIN
+	-- J1. A stream that got a first byte and never produced content. This is the common case for an
+	-- abandoned call, and the wrong answer here is the plausible one: a gap of 0 reads as "no thinking
+	-- happened" on every panel that averages it.
+	INSERT INTO call_events (event_key, source, source_ids, id, ts, backend, "key", status, aborted, ttft_ms)
+	VALUES ('rooter|r-1009', 'rooter', '{rooter|r-1009}', 'r-1009',
+		'2026-11-04T09:20:00Z', 'sushi', 'pi-code', 499, true, 2350.2);
+
+	SELECT first_content_gap_ms INTO gap FROM call_events WHERE event_key = 'rooter|r-1009';
+	IF gap IS NOT NULL THEN
+		RAISE EXCEPTION 'J1: a call with a first byte and no content token got a gap of %; an unmeasured gap is NULL, and 0 is a number panels will average', gap;
+	END IF;
+
+	-- J2. The content measurement arrives on a later write. Nobody recomputed anything: the column is
+	-- generated, so it is recalculated by the row it just became true of. A plain column would sit at
+	-- NULL here forever, which is how a measurement quietly becomes a coverage hole.
+	UPDATE call_events SET first_content_ms = 32666.1 WHERE event_key = 'rooter|r-1009';
+
+	SELECT ttft_ms, first_content_ms, first_content_gap_ms INTO ttft, fc, gap
+		FROM call_events WHERE event_key = 'rooter|r-1009';
+	IF round(gap::numeric, 6) IS DISTINCT FROM round((fc - ttft)::numeric, 6) THEN
+		RAISE EXCEPTION 'J2: gap % is not first_content_ms % minus ttft_ms %', gap, fc, ttft;
+	END IF;
+	RAISE NOTICE 'J2: right - the gap appeared on its own when the missing half arrived: ttft % -> content %, gap %', ttft, fc, gap;
+
+	-- J3. A surface cannot publish its own idea of the gap. Without this, a runner that measured the
+	-- interval differently could write it into the same column the store derives, and the two definitions
+	-- would be averaged together on a dashboard with nothing in the row saying which one a number came
+	-- from.
+	BEGIN
+		INSERT INTO call_events (event_key, source, source_ids, id, ts, backend, ttft_ms, first_content_ms, first_content_gap_ms)
+		VALUES ('rooter|r-1010', 'rooter', '{rooter|r-1010}', 'r-1010',
+			'2026-11-04T09:21:00Z', 'sushi', 100.0, 200.0, 12.0);
+		RAISE EXCEPTION 'J3: WRONG - a writer was allowed to supply first_content_gap_ms, so the column can disagree with the two measurements it is derived from';
+	EXCEPTION WHEN others THEN
+	 GET STACKED DIAGNOSTICS msg = message_text;
+	 IF position('first_content_gap_ms' in msg) = 0 THEN
+	 	RAISE EXCEPTION 'J3: the insert failed for some other reason, which is not this contract: %', msg;
+	 END IF;
+	 RAISE NOTICE 'J3: right - a supplied gap is refused: %', msg;
+ END;
+
+	-- J4. And the coverage the store reports has to distinguish "no thinking" from "never measured", or
+	-- the mean gap is computed over a population nobody can see.
+	PERFORM 1;
+END $$;
+
+DO $$
+DECLARE
+	r record;
+BEGIN
+	SELECT * INTO r FROM call_quality WHERE backend = 'sushi';
+	IF r.calls_with_first_content_ms IS NULL OR r.calls_with_first_content_ms = 0 THEN
+		RAISE EXCEPTION 'J4: call_quality reports no first_content_ms coverage for sushi, so the mean gap is an average over an unseen population';
+	END IF;
+	RAISE NOTICE 'J4: coverage - % of % sushi rows have a first-content measurement, mean ttft %, mean first content %, mean gap %',
+		r.calls_with_first_content_ms, r.calls,
+		r.mean_ttft_ms, r.mean_first_content_ms, r.mean_first_content_gap_ms;
 END $$;
 
 ROLLBACK;

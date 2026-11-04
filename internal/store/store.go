@@ -100,11 +100,18 @@ type Event struct {
 
 	Error map[string]any
 
-	WaitMs   *float64
-	TTFTMs   *float64
-	TotalMs  *float64
-	PromptMs *float64
-	DecodeMs *float64
+	WaitMs *float64
+	TTFTMs *float64
+	// FirstContentMs is when the first token of CONTENT arrived, measured from the same anchor as
+	// TTFTMs (the first byte of the response). Both belong to whichever observer watched the wire, and
+	// neither is derivable from the other: on a reasoning model the distance between them is seconds,
+	// and that distance is the only signal that says a box was busy while nothing had failed. The gap
+	// itself is Postgres's to compute - there is no field for it here, deliberately, because a writer
+	// that supplied it could disagree with the two numbers it is derived from.
+	FirstContentMs *float64
+	TotalMs        *float64
+	PromptMs       *float64
+	DecodeMs       *float64
 
 	PromptTokens *int64
 	// PromptTokensComputed is the observer's arithmetic answer for the prompt length, kept apart from
@@ -290,7 +297,10 @@ INSERT INTO call_events (
 	prompt_tokens, completion_tokens, cached_tokens, engine_cached_tokens,
 	prefill_tok_s, decode_tok_s, expert_cache_hit_rate,
 	usage_source, finish_reason, drafts_offered, drafts_accepted, extra, join_method,
-	prompt_tokens_computed
+	-- first_content_ms last, for the same reason prompt_tokens_computed is: appending keeps every
+	-- existing $n meaning what it meant. first_content_gap_ms is absent because it cannot be written -
+	-- it is a STORED generated column, and Postgres refuses an INSERT that names it.
+	prompt_tokens_computed, first_content_ms
 ) VALUES (
 	$1, $2, $3, $4, $5, $6, $7,
 	$8, $9, $10, $11, $12, $13, $14, $15,
@@ -298,7 +308,7 @@ INSERT INTO call_events (
 	$26, $27, $28, $29, $30,
 	$31, $32, $33, $34,
 	$35, $36, $37,
-	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self'), $44
+	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self'), $44, $45
 )
 ON CONFLICT (event_key) DO UPDATE SET
 	id                   = COALESCE(call_events.id, EXCLUDED.id),
@@ -334,6 +344,10 @@ ON CONFLICT (event_key) DO UPDATE SET
 	-- numbers of every existing fact keep their meaning. It stays its own column: the reported count is
 	-- never overwritten by a computed one, in either direction.
 	prompt_tokens_computed = COALESCE(call_events.prompt_tokens_computed, EXCLUDED.prompt_tokens_computed),
+	-- A surface that re-reports a call without the content measurement must not delete the one that
+	-- already had it. This is how the thinking gap gets lost in practice: the observer that measured it
+	-- is usually not the observer that reports the call again.
+	first_content_ms     = COALESCE(call_events.first_content_ms, EXCLUDED.first_content_ms),
 	completion_tokens    = COALESCE(call_events.completion_tokens, EXCLUDED.completion_tokens),
 	cached_tokens        = COALESCE(call_events.cached_tokens, EXCLUDED.cached_tokens),
 	engine_cached_tokens = COALESCE(call_events.engine_cached_tokens, EXCLUDED.engine_cached_tokens),
@@ -408,7 +422,7 @@ func (s *Store) upsert(ctx context.Context, ev Event, key string, joinOverride *
 		derefOpt(ev.PromptTokens), derefOpt(ev.CompletionTokens), derefOpt(ev.CachedTokens), derefOpt(ev.EngineCachedTokens),
 		derefOpt(ev.PrefillTokS), derefOpt(ev.DecodeTokS), derefOpt(ev.ExpertCacheHitRate),
 		usageSourceOrDefault(ev.UsageSource), nullableString(ev.FinishReason), derefOpt(ev.DraftsOffered), derefOpt(ev.DraftsAccepted),
-		extra, nullableString(joinOverride), derefOpt(ev.PromptTokensComputed),
+		extra, nullableString(joinOverride), derefOpt(ev.PromptTokensComputed), derefOpt(ev.FirstContentMs),
 	)
 	if err := row.Scan(&res.EventKey, &inserted, &res.JoinMethod, &res.SourceCount, &res.HasUsage); err != nil {
 		return Result{}, fmt.Errorf("write %s: %w", key, err)

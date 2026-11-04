@@ -74,8 +74,17 @@ type rooterRecord struct {
 	Error           string  `json:"error"`
 	WaitMs          float64 `json:"wait_ms"`
 	TTFTMs          float64 `json:"ttft_ms"`
-	TotalMs         float64 `json:"total_ms"`
-	PromptTokens    *int64  `json:"prompt_tokens"`
+	// FirstContentMs is rooter's own name for the first content token, and this store keeps the name.
+	// The two are measured from one anchor on one observer's clock, which is what makes the difference
+	// between them meaningful - and it is also why the difference is computed in the database rather
+	// than here, so no arithmetic of mine can end up on a dashboard next to someone else's.
+	//
+	// A pointer because "absent" is a real state and 0 is not it. Measured across 393 live ring records
+	// today: every one carries a non-zero first_content_ms (they are all streamed), so a nil here is a
+	// surface that did not measure content at all rather than a call that produced a token instantly.
+	FirstContentMs *float64 `json:"first_content_ms"`
+	TotalMs        float64  `json:"total_ms"`
+	PromptTokens   *int64   `json:"prompt_tokens"`
 	// Rooter publishes its own arithmetic answer for the prompt length next to llama.cpp's reported
 	// count, because prompt_n is not the whole prompt. Live: prompt_tokens 98060,
 	// prompt_tokens_computed 98060, extra.prompt_n 98060. It is stored as its own column and never
@@ -147,16 +156,17 @@ func (r *Rooter) Pull(ctx context.Context) ([]store.Event, error) {
 
 func (r *Rooter) event(rec rooterRecord) store.Event {
 	ev := store.Event{
-		EventKey:  "rooter|" + rec.ID,
-		Source:    "rooter",
-		SourceIDs: []string{"rooter|" + rec.ID},
-		Stream:    &rec.Stream,
-		Aborted:   &rec.Aborted,
-		Status:    &rec.Status,
-		Bytes:     &rec.Bytes,
-		WaitMs:    &rec.WaitMs,
-		TTFTMs:    &rec.TTFTMs,
-		TotalMs:   &rec.TotalMs,
+		EventKey:       "rooter|" + rec.ID,
+		Source:         "rooter",
+		SourceIDs:      []string{"rooter|" + rec.ID},
+		Stream:         &rec.Stream,
+		Aborted:        &rec.Aborted,
+		Status:         &rec.Status,
+		Bytes:          &rec.Bytes,
+		WaitMs:         &rec.WaitMs,
+		TTFTMs:         &rec.TTFTMs,
+		FirstContentMs: rec.FirstContentMs,
+		TotalMs:        &rec.TotalMs,
 	}
 	if s, err := time.Parse(time.RFC3339Nano, rec.TS); err == nil {
 		ev.TS = s.UTC()

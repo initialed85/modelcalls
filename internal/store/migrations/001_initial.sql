@@ -156,6 +156,18 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- go looking for when a dashboard says "the model got slower".
 	wait_ms double precision check (wait_ms is null or wait_ms >= 0),
 	ttft_ms double precision check (ttft_ms is null or ttft_ms >= 0),
+	-- first_content_ms is the first token of CONTENT, from the same anchor as ttft_ms, which is the
+	-- first byte of the response. On a reasoning model these are far apart - measured on rooter's live
+	-- ring: ttft 24ms with content 488ms later on one call, ttft 2350ms with content at 32666ms on
+	-- another - and the distance between them is the only thing that says a box was busy while nothing
+	-- had failed. Storing ttft alone is how a dashboard reports a healthy fast box over a call that
+	-- spent half a minute thinking.
+	first_content_ms double precision check (first_content_ms is null or first_content_ms >= 0),
+	-- Derived from the two above, stored, and unsettable: the components can arrive in different
+	-- writes (an aborted stream has a first byte and no content token), and a generated column
+	-- recalculates when the merge fills the missing half. A plain column here could be written by a
+	-- surface with its own idea of the gap, which is a number a panel would then average.
+	first_content_gap_ms double precision GENERATED ALWAYS AS (first_content_ms - ttft_ms) STORED,
 	prompt_ms double precision check (prompt_ms is null or prompt_ms >= 0),
 	decode_ms double precision check (decode_ms is null or decode_ms >= 0),
 	total_ms double precision check (total_ms is null or total_ms >= 0),
@@ -429,11 +441,68 @@ DROP TRIGGER IF EXISTS call_events_rates ON call_events;
 CREATE TRIGGER call_events_rates BEFORE INSERT OR UPDATE ON call_events
 	FOR EACH ROW EXECUTE FUNCTION call_events_derive_rates();
 
+-- ─── the columns the views below reference ─────────────────────────────────────────────
+--
+-- Idempotent ALTERs, in the file that every boot runs first, because the views underneath reference
+-- columns that 002/003/004 exist to add to databases that predate them. Without this block the upgrade
+-- path is broken in a way that only shows up on a database that has been in use: 001 runs, its
+-- CREATE TABLE IF NOT EXISTS adds nothing to an existing table, and then CREATE OR REPLACE VIEW
+-- references a column that nothing has added yet - "column does not exist" at boot, on the pod that has
+-- been running fine for a month. A fresh database never sees this; an installed one hits it on the
+-- first restart after a migration is added, which is the worst possible time.
+--
+-- The definitions here are byte-for-byte the ones in 003 and 004. That duplication is deliberate and
+-- load-bearing: if they drifted, this file would create a column the later file then refuses to accept,
+-- or the reverse. 003 and 004 each verify what actually landed in the database they just ran against.
+DO $$
+BEGIN
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS
+		prompt_tokens_computed integer check (prompt_tokens_computed is null or prompt_tokens_computed >= 0);
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS cache_rate_undefined boolean GENERATED ALWAYS AS (
+		(prompt_tokens is not null and prompt_tokens > 0 and (
+			(cached_tokens is not null and cached_tokens > prompt_tokens)
+			or (engine_cached_tokens is not null and engine_cached_tokens > prompt_tokens)
+		))
+	) STORED;
+	-- The two reported rates. Not generated - the engine and the runner report them, and the trigger
+	-- above only fills them in when the components allow a rate to be derived - so they are declared
+	-- exactly as the CREATE TABLE declares them, check included. A column whose upgraded shape differs
+	-- from its fresh shape is a column whose constraints depend on which path a database happened to
+	-- take, and nobody reasons about that at 3am.
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS engine_cache_hit_rate double precision
+		check (engine_cache_hit_rate is null or (engine_cache_hit_rate >= 0 and engine_cache_hit_rate <= 1));
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS expert_cache_hit_rate double precision
+		check (expert_cache_hit_rate is null or (expert_cache_hit_rate >= 0 and expert_cache_hit_rate <= 1));
+
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS
+		first_content_ms double precision check (first_content_ms is null or first_content_ms >= 0);
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS first_content_gap_ms double precision
+		GENERATED ALWAYS AS (first_content_ms - ttft_ms) STORED;
+END $$;
+
 -- ─── calls: the view dashboards should read ────────────────────────────────────────────
 --
 -- A thin, boring surface over the table with a stable call id. Reading the table directly is
 -- fine for forensics; reading this is what keeps a panel honest when the join rules change.
-CREATE OR REPLACE VIEW calls AS
+--
+-- DROP and CREATE, not CREATE OR REPLACE, and that is load-bearing rather than taste. A view is a
+-- projection, so dropping it loses nothing; but Postgres will not let CREATE OR REPLACE VIEW change
+-- the name or position of a column the view already has, and every column this file has ever added
+-- lands somewhere in that list. So `CREATE OR REPLACE` makes this migration succeed on a database
+-- created today and fail on a database created last month, at process start, because the harvester
+-- migrates before it serves.
+--
+-- Measured on the live dev store, not simulated: 001 ran against a database whose view had
+-- engine_cache_hit_rate in position 28 - where it had been since it was written - and the boot died
+-- with "cannot change name of view column \"engine_cache_hit_rate\" to \"prefill_tok_s\"". Nothing about
+-- the data was wrong; nothing about the fresh-install path was wrong. The only thing that would have
+-- caught it is a test that migrates an old database, which is what test/legacy_upgrade_path.sql is.
+--
+-- The table keeps its columns appended at the end because ALTER TABLE ADD COLUMN has no other option,
+-- so the view lists them in the table's order and the two stay comparable. The view is free to reorder;
+-- it does not, because a panel that reads by position is a panel that would silently change meaning.
+DROP VIEW IF EXISTS calls;
+CREATE VIEW calls AS
 SELECT
 	coalesce(nullif(upstream_id, ''), event_key) AS call_id,
 	backend,
@@ -462,8 +531,6 @@ SELECT
 	cached_tokens,
 	engine_cached_tokens,
 	cache_hit_rate,
-	engine_cache_hit_rate,
-	expert_cache_hit_rate,
 	prefill_tok_s,
 	decode_tok_s,
 	wait_ms,
@@ -471,7 +538,29 @@ SELECT
 	prompt_ms,
 	decode_ms,
 	total_ms,
-	join_method
+	join_method,
+	-- Everything added since the first schema shipped is appended HERE and nowhere else, and that is a
+	-- requirement rather than tidiness. `calls` is created with CREATE OR REPLACE VIEW, and Postgres will
+	-- add columns to an existing view only at the end, in order; it refuses to change the name or
+	-- position of a column the view already has. So these four are what a database created before them
+	-- can accept, and the same four slotted into the middle of the list is a migration that fails at
+	-- process start - which is exactly where 001 runs, because the harvester migrates before it serves.
+	--
+	-- Measured, not predicted, twice over. first_content_ms in the middle killed a store that had been
+	-- running for a day ("cannot change name of view column prompt_ms to first_content_ms"). And
+	-- engine_cache_hit_rate sat here in position 28 for weeks, which is why the very first installed
+	-- schema cannot be upgraded at all: the view replacement fails before the ALTER that would have
+	-- added the column can matter. Both are caught by test/legacy_upgrade_path.sql, which builds the old
+	-- shape from a frozen snapshot and migrates it forward, so the next column added in the wrong place
+	-- fails a lane instead of a deploy.
+	--
+	-- What this rule costs is that the view's column order is historical rather than logical, and a
+	-- reader who wants cached_tokens next to cache_hit_rate cannot have them. That is the right trade:
+	-- order here is cosmetic, and a migration that only works on an empty database is not a migration.
+	engine_cache_hit_rate,
+	expert_cache_hit_rate,
+	first_content_ms,
+	first_content_gap_ms
 FROM call_events;
 
 -- ─── call_quality: the store's own trustworthiness, as data ────────────────────────────
@@ -509,7 +598,21 @@ SELECT
 	avg(engine_cached_tokens::numeric / NULLIF(prompt_tokens, 0))
 		FILTER (WHERE engine_cached_tokens is not null and prompt_tokens is not null and prompt_tokens > 0)
 		AS mean_engine_cache_rate,
-	avg(expert_cache_hit_rate) FILTER (WHERE expert_cache_hit_rate is not null) AS mean_expert_cache_rate
+	avg(expert_cache_hit_rate) FILTER (WHERE expert_cache_hit_rate is not null) AS mean_expert_cache_rate,
+	-- Coverage of the two halves of the thinking gap separately, because they fail independently: a
+	-- streaming call that was cut off has a first byte and no content token, and a surface that never
+	-- measured content at all has neither. A mean over the gap is only honest if you can see how many
+	-- rows the mean was taken from.
+	count(*) FILTER (WHERE first_content_ms is not null) AS calls_with_first_content_ms,
+	count(*) FILTER (WHERE first_content_gap_ms is not null) AS calls_with_first_content_gap,
+	avg(ttft_ms) FILTER (WHERE ttft_ms is not null) AS mean_ttft_ms,
+	avg(first_content_ms) FILTER (WHERE first_content_ms is not null) AS mean_first_content_ms,
+	avg(first_content_gap_ms) FILTER (WHERE first_content_gap_ms is not null) AS mean_first_content_gap_ms,
+	-- The gap is `first_content - ttft` and both come from one observer's clock. A negative one means an
+	-- observer recorded content before it recorded the first byte, which is a contradiction rather than
+	-- a fast model - counted here rather than CHECK-rejected, because the alternative is dropping the
+	-- call and the measurement with it.
+	count(*) FILTER (WHERE first_content_gap_ms < 0) AS calls_with_negative_first_content_gap
 FROM call_events
 GROUP BY backend;
 

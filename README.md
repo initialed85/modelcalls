@@ -158,6 +158,19 @@ Once strata exposes that id, this source sets `UpstreamID`, the join becomes pat
 - **`extra` is namespaced by source by the store.** A writer's payload lands under its `source`
   name. If two surfaces both call their payload `raw`, a merge would silently turn *who said what*
   into *who wrote last*.
+- **The thinking gap is Postgres's to compute.** `first_content_ms` is when the first *content* token
+  arrived; `ttft_ms` is the first byte of the response; both come from the same anchor on the same
+  observer's clock, and the difference is what a reasoning model spends before anything on a dashboard
+  changes. Measured on rooter's live ring: `ttft_ms 2350.2` with the first content token at
+  `first_content_ms 32666.1` — a panel on `ttft_ms` reports 2.3 seconds for a call where a reader waited
+  half a minute, and nothing looks broken. So `first_content_gap_ms` is a STORED generated column and no
+  writer can supply it: an insert that names it is refused. A column a surface could write is a column
+  two observers could define differently and a dashboard could average both into one number with nothing
+  in the row saying which is which. An unmeasured gap is NULL rather than 0, because 0 reads as "no
+  thinking happened" everywhere it is aggregated, and `call_quality` publishes
+  `calls_with_first_content_gap` so the mean's population is visible next to the mean. One observer's
+  clock being ahead of another's produces a negative gap; that is counted
+  (`calls_with_negative_first_content_gap`), not rejected.
 - **`call_quality` reports the store's own weaknesses as data**: `calls_without_usage`,
   `calls_joined_by_content`, `calls_joined_by_timing_only`, `calls_with_undefined_cache_rate`,
   `calls_with_observed_ts`. Any panel built on `calls` can be asked how much of its number depends on a
@@ -168,6 +181,12 @@ Once strata exposes that id, this source sets `UpstreamID`, the join becomes pat
 `calls` is one row per call, with `call_id` as the stable handle: `upstream_id` when one exists, the
 store key when nothing identified the call. `call_quality` aggregates the shape per backend and
 day.
+
+The mean timing columns are per backend, and deliberately not published as a total anywhere — including
+by the harvester, which emits `modelcalls_call_mean_first_content_gap_ms{backend="sushi"}` and no
+unlabelled version. The mean of two per-backend means is not the mean over the calls: averaging a box
+that served 60 calls with one that served 3 is a number about neither, and `modelcalls_calls_with_first_content_gap`
+is what tells you how many rows any mean is a mean of.
 
 ## Running the contract
 
@@ -194,10 +213,49 @@ A real Postgres 16 is required. The contract *is* Postgres — partial unique in
 merge arithmetic, generated columns, jsonb concatenation — and there is no useful version of this
 against a fake database. [Woodpecker CI](https://woodpecker.dev.initialed85.cc/initialed85/modelcalls)
 runs both halves against a `postgres:16` service on every push, applies the migrations **twice**,
-applies the scenarios **twice**, and then drops the whole schema and rebuilds it with the compiled
-binary (`./entrypoint -migrate-only`) before it is allowed to publish anything. Re-runnability is not
-a claim this repo makes in a comment; a Deployment applies these migrations on every start, so a
-migration that only works once is a rollout that crashes on the second boot.
+applies the scenarios **twice**, migrates a frozen copy of the first schema ever shipped, and then drops
+the whole schema and rebuilds it with the compiled binary (`./entrypoint -migrate-only`) before it is
+allowed to publish anything. Re-runnability is not a claim this repo makes in a comment; a Deployment
+applies these migrations on every start, so a migration that only works once is a rollout that crashes
+on the second boot.
+
+### Migrating a database that already exists
+
+Re-running a migration is not the hard case, and the lane used to prove only that until it cost a
+deploy. The hard case is a migration running for the *second* time on a database that has rows, has
+views with columns, and has named constraints — because that is the only kind of database that survives
+a week, and Postgres is strict there in ways a fresh install is not:
+
+- `ALTER TABLE ... ADD COLUMN` only appends. A column list in a CREATE TABLE that assumes otherwise is
+  describing a shape no live database can reach.
+- `CREATE OR REPLACE VIEW` adds columns **at the end or not at all**: it refuses to change the name or
+  position of a column an existing view already has.
+- A `CHECK` constraint cannot be swapped while existing rows violate it. 002's tier rename is handled by
+  dropping the constraint and re-adding it `NOT VALID`, so the ALTER that has to happen at process start
+  succeeds and the scan that proves the old rows happen later.
+
+Two of those were paid for in failures, both at boot, because the harvester migrates before it serves.
+Putting `first_content_ms` in the middle of the `calls` view killed a store that had been running for a
+day: `cannot change name of view column "prompt_ms" to "first_content_ms"`. Fixing the order for that
+then hit `engine_cache_hit_rate`, which had sat in position 28 since it was written — which is why a
+database created by the first shipped schema could not be upgraded at all. The view is now `DROP` +
+`CREATE` (a projection loses nothing when dropped); the table's additions stay appended.
+
+`test/legacy_schema_snapshot.sql` is a verbatim, never-edited copy of that first schema (431c17e), and
+`test/legacy_upgrade_path.sql` applies it, puts a row of data in it, runs the current migrations on top
+in the order the harvester runs them, and asserts the result: the added columns exist, the four columns
+added since are the last four in `calls`, a row written before the upgrade is still readable through the
+view with the old tier name intact and the columns it never had still NULL, and `usage_content_window`
+is accepted on a table that predates the tier. Run it against the same Postgres the rest of the lane
+uses:
+
+```bash
+docker exec -i mc-pg psql -U mc -d modelcalls_upgrade -v ON_ERROR_STOP=1 \
+  -f test/legacy_upgrade_path.sql
+```
+
+The lane's fresh-install steps come first, and this one runs in its own database because it is the only
+step that starts by dropping the schema.
 
 ## Deployed
 

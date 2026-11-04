@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/lib/pq"
 	"time"
 
 	"github.com/initialed85/modelcalls/internal/store"
@@ -1086,5 +1088,87 @@ func promptOf(eventKey string) int64 {
 		return 52922
 	default:
 		return 0
+	}
+}
+
+// TestThinkingGapIsComputedNotSupplied is the Go mirror of contract scenario step J, and it exists
+// because the two halves of this fact arrive at different times in production: rooter's ring reports a
+// call it saw end (first byte, no content token), and the content measurement arrives on a later pull.
+// If the gap were a column a writer set, the second write would have to remember to recompute it - and
+// the failure would be silent, a column that is NULL on exactly the rows that were merged.
+func TestThinkingGapIsComputedNotSupplied(t *testing.T) {
+	ctx, st := setup(t)
+
+	// A stream that got a first byte and never produced content.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|gap-1", Source: "rooter", SourceIDs: []string{"rooter|gap-1"},
+		ID: str("gap-1"), Backend: str("sushi"), Key: str("probe"),
+		TS: time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC), Aborted: bval(true),
+		TTFTMs: f64(2350.2),
+	}); err != nil {
+		t.Fatalf("write first half: %v", err)
+	}
+
+	var gap *float64
+	if err := st.DB().QueryRowContext(ctx,
+		"SELECT first_content_gap_ms FROM call_events WHERE event_key = $1", "rooter|gap-1").Scan(&gap); err != nil {
+		t.Fatalf("read gap: %v", err)
+	}
+	if gap != nil {
+		t.Errorf("a call with a first byte and no content token has a gap of %v: an unmeasured gap is NULL, and 0 is a number a panel averages", *gap)
+	}
+
+	// The missing half arrives on a later write of the same event. Nobody recomputed anything.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|gap-1", Source: "rooter", SourceIDs: []string{"rooter|gap-1"},
+		ID: str("gap-1"), Backend: str("sushi"), Key: str("probe"),
+		TS:             time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC),
+		FirstContentMs: f64(32666.1),
+	}); err != nil {
+		t.Fatalf("write second half: %v", err)
+	}
+	var ttft, first, computed float64
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT ttft_ms, first_content_ms, first_content_gap_ms FROM call_events WHERE event_key = $1`,
+		"rooter|gap-1").Scan(&ttft, &first, &computed); err != nil {
+		t.Fatalf("read merged row: %v", err)
+	}
+	if d := computed - (first - ttft); d > 1e-9 || d < -1e-9 {
+		t.Errorf("gap after the merge is %v, want %v (first_content_ms %v - ttft_ms %v)", computed, first-ttft, first, ttft)
+	}
+	if computed < 30000 {
+		t.Errorf("gap %v: the merged row lost the measurement, since ttft %v to content %v is a %v second gap",
+			computed, ttft, first, computed/1000)
+	}
+	t.Logf("gap computed by Postgres from the two components: ttft %.1f -> first content %.1f, gap %.1f ms", ttft, first, computed)
+
+	// A re-pull that carries neither timing must not erase either half. This is the shape the fact gets
+	// lost in: the surface that reports a call again is usually not the one that measured it.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|gap-1", Source: "rooter", SourceIDs: []string{"rooter|gap-1"},
+		ID: str("gap-1"), Backend: str("sushi"), Key: str("probe"),
+		TS: time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("re-pull: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		"SELECT first_content_ms FROM call_events WHERE event_key = $1", "rooter|gap-1").Scan(&first); err != nil {
+		t.Fatalf("read after re-pull: %v", err)
+	}
+	if first != 32666.1 {
+		t.Errorf("first_content_ms is %v after a re-pull that carried no measurement, want 32666.1 preserved", first)
+	}
+
+	// And a writer cannot supply the gap. Same reason the cache rates are derived: two definitions of
+	// one quantity in one column get averaged together on a dashboard with nothing in the row saying
+	// which number came from where.
+	_, err := st.DB().ExecContext(ctx, `INSERT INTO call_events
+		(event_key, source, source_ids, id, ts, backend, ttft_ms, first_content_ms, first_content_gap_ms)
+		VALUES ($1,'rooter',$2,$3,$4,'sushi',100,200,12)`,
+		"rooter|gap-2", pq.StringArray{"rooter|gap-2"}, "gap-2", time.Now().UTC())
+	if err == nil {
+		t.Errorf("a writer was allowed to supply first_content_gap_ms, so the column can disagree with the two measurements it derives from")
+	} else if !strings.Contains(err.Error(), "first_content_gap_ms") {
+		t.Errorf("the insert failed for a different reason, which is not this contract: %v", err)
 	}
 }
