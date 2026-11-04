@@ -51,10 +51,17 @@ steps:
       # `ls` rather than a bare glob because these steps run under sh in the service's companion
       # image, and an unmatched glob would hand the literal pattern to psql. Fails loudly, which is
       # the correct outcome for an empty migrations directory.
-      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate: $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
+      #
+      # And no `: ` anywhere in these two lines, deliberately. A plain YAML scalar containing
+      # colon-space parses as a MAPPING, and the server then rejects the whole workflow before any step
+      # runs: status `error`, zero steps, zero logs, and the lint step that would have said why never
+      # executes. home-ops/hack/check-woodpecker-config.py names this exact case - "the failure with no
+      # step logs" - and I pushed this file without running it, which is the only reason pipeline 4
+      # exists. Run the checker before pushing a workflow, not after a red lane.
+      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
       # Second pass over the same database. Every migration in this repo claims to be safe to re-apply;
       # this is where that claim is tested rather than asserted in a comment.
-      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate again: $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
+      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate again $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
       # The scenarios twice as well: they assert the contract from a known state, and half of them are
       # "this statement must fail", which is only meaningful if it still fails on a database that has
       # already been through them.
