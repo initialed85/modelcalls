@@ -118,10 +118,23 @@ type Event struct {
 	// PromptTokens because llama.cpp's `prompt_n` is not the whole prompt and overwriting one with the
 	// other would erase the only evidence of how often they differ. A surface that has no separate
 	// computed value leaves it NULL; it is not filled in with the reported count.
+	//
+	// Which of the two is arithmetic varies by engine, so the pair below says so. Live: strata's
+	// prompt_n is the work done this pass (this field is the runner's number verbatim), while sushi's
+	// prompt_n is the FULL length and this field is prompt_n - cached_n, i.e. rooter's subtraction.
 	PromptTokensComputed *int64
-	CompletionTokens     *int64
-	CachedTokens         *int64
-	EngineCachedTokens   *int64
+	// RunnerPromptNIncludesCache is the engine's own statement about what its prompt_n means: true
+	// when prompt_n counts the prompt INCLUDING whatever was served from cache (llama.cpp/sushi),
+	// false/absent when it is the work done this pass (strata). NULL means the surface did not say,
+	// which is not the same as false - reading an unknown as "no" is how a fact gets laundered.
+	RunnerPromptNIncludesCache *bool
+	// PromptTokensDerived is the router's statement about whether PromptTokens is its own addition of
+	// prompt_n + cached_n rather than a number read off the wire. NULL when the surface has not said
+	// (rooter added the field after this column existed), which is not the same as false.
+	PromptTokensDerived *bool
+	CompletionTokens    *int64
+	CachedTokens        *int64
+	EngineCachedTokens  *int64
 
 	PrefillTokS *float64
 	DecodeTokS  *float64
@@ -300,7 +313,10 @@ INSERT INTO call_events (
 	-- first_content_ms last, for the same reason prompt_tokens_computed is: appending keeps every
 	-- existing $n meaning what it meant. first_content_gap_ms is absent because it cannot be written -
 	-- it is a STORED generated column, and Postgres refuses an INSERT that names it.
-	prompt_tokens_computed, first_content_ms
+	-- The provenance pair is the same rule: it is the two fields that say which of the numbers above
+	-- is arithmetic, and a field that explains the meaning of a stored column is not optional.
+	prompt_tokens_computed, first_content_ms,
+	runner_prompt_n_includes_cache, prompt_tokens_derived
 ) VALUES (
 	$1, $2, $3, $4, $5, $6, $7,
 	$8, $9, $10, $11, $12, $13, $14, $15,
@@ -308,7 +324,8 @@ INSERT INTO call_events (
 	$26, $27, $28, $29, $30,
 	$31, $32, $33, $34,
 	$35, $36, $37,
-	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self'), $44, $45
+	$38, $39, $40, $41, jsonb_build_object($2::text, $42::jsonb), COALESCE($43::text, 'self'), $44, $45,
+	$46, $47
 )
 ON CONFLICT (event_key) DO UPDATE SET
 	id                   = COALESCE(call_events.id, EXCLUDED.id),
@@ -348,6 +365,12 @@ ON CONFLICT (event_key) DO UPDATE SET
 	-- already had it. This is how the thinking gap gets lost in practice: the observer that measured it
 	-- is usually not the observer that reports the call again.
 	first_content_ms     = COALESCE(call_events.first_content_ms, EXCLUDED.first_content_ms),
+	-- A provenance flag is not overwritten by a sighting that does not have one. Same argument as
+	-- above, and sharper here: the flag is what makes the number beside it interpretable, so a later
+	-- report that says nothing must not erase what an earlier report did say.
+	runner_prompt_n_includes_cache = COALESCE(call_events.runner_prompt_n_includes_cache,
+											EXCLUDED.runner_prompt_n_includes_cache),
+	prompt_tokens_derived = COALESCE(call_events.prompt_tokens_derived, EXCLUDED.prompt_tokens_derived),
 	completion_tokens    = COALESCE(call_events.completion_tokens, EXCLUDED.completion_tokens),
 	cached_tokens        = COALESCE(call_events.cached_tokens, EXCLUDED.cached_tokens),
 	engine_cached_tokens = COALESCE(call_events.engine_cached_tokens, EXCLUDED.engine_cached_tokens),
@@ -423,6 +446,7 @@ func (s *Store) upsert(ctx context.Context, ev Event, key string, joinOverride *
 		derefOpt(ev.PrefillTokS), derefOpt(ev.DecodeTokS), derefOpt(ev.ExpertCacheHitRate),
 		usageSourceOrDefault(ev.UsageSource), nullableString(ev.FinishReason), derefOpt(ev.DraftsOffered), derefOpt(ev.DraftsAccepted),
 		extra, nullableString(joinOverride), derefOpt(ev.PromptTokensComputed), derefOpt(ev.FirstContentMs),
+		derefOpt(ev.RunnerPromptNIncludesCache), derefOpt(ev.PromptTokensDerived),
 	)
 	if err := row.Scan(&res.EventKey, &inserted, &res.JoinMethod, &res.SourceCount, &res.HasUsage); err != nil {
 		return Result{}, fmt.Errorf("write %s: %w", key, err)

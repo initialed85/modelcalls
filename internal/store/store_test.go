@@ -1172,3 +1172,101 @@ func TestThinkingGapIsComputedNotSupplied(t *testing.T) {
 		t.Errorf("the insert failed for a different reason, which is not this contract: %v", err)
 	}
 }
+
+// TestPromptProvenanceSurvivesTheMerge is the store-level half of migration 005.
+//
+// The reason this is a test and not a comment is that the two engines' shapes are genuinely
+// different, and the field that says which is which is the one the harvester was dropping:
+//
+//	sushi   prompt 72292  computed 742   cached 71550  prompt_n 72292  includes_cache true
+//	strata  prompt 60174  computed 140   cached 60034  prompt_n 140    includes_cache <absent>
+//
+// Both satisfy cached + computed == prompt. On sushi that is the router's own subtraction, i.e. a
+// tautology; on strata it is two independent fields agreeing. The store's cache rates use prompt as
+// the denominator, so the difference decides whether a rate is a measurement or arithmetic, and the
+// only thing that says which is the flag.
+//
+// The merge path is what matters here, not the insert: the surface that knows the semantics is
+// usually not the surface that reports the call again, and a re-pull that carries no flag must not
+// erase the flag that made the row readable.
+func TestPromptProvenanceSurvivesTheMerge(t *testing.T) {
+	ctx, st := setup(t)
+
+	// A sushi-shaped row: prompt_n is the full length, so the computed column is the router's
+	// subtraction, and the engine says so.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|prov-1", Source: "rooter", SourceIDs: []string{"rooter|prov-1"},
+		ID: str("prov-1"), Backend: str("sushi"), Key: str("pi-code"),
+		TS:           time.Date(2026, 11, 4, 11, 0, 0, 0, time.UTC),
+		PromptTokens: i64(72292), PromptTokensComputed: i64(742), CachedTokens: i64(71550),
+		RunnerPromptNIncludesCache: bval(true),
+	}); err != nil {
+		t.Fatalf("write with flag: %v", err)
+	}
+
+	// A row from a surface that said nothing. NULL, not false - "the engine did not tell us" and
+	// "the engine told us no" are different facts, and reading the first as the second would let a
+	// panel conclude that every prompt_n in the store is a work count.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|prov-2", Source: "rooter", SourceIDs: []string{"rooter|prov-2"},
+		ID: str("prov-2"), Backend: str("strata"), Key: str("pi-code"),
+		TS:           time.Date(2026, 11, 4, 11, 0, 1, 0, time.UTC),
+		PromptTokens: i64(60174), PromptTokensComputed: i64(140), CachedTokens: i64(60034),
+	}); err != nil {
+		t.Fatalf("write without flag: %v", err)
+	}
+
+	var said, silent *bool
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT runner_prompt_n_includes_cache, prompt_tokens_derived FROM calls WHERE call_id = $1`,
+		"rooter|prov-2").Scan(&said, &silent); err != nil {
+		t.Fatalf("read prov-2 through the view: %v", err)
+	}
+	if said != nil {
+		t.Errorf("a row whose surface said nothing has runner_prompt_n_includes_cache = %v; an unknown must stay NULL, because false is a claim", *said)
+	}
+	if silent != nil {
+		t.Errorf("a row whose surface said nothing has prompt_tokens_derived = %v", *silent)
+	}
+
+	// The merge: a re-pull that carries the numbers and not the flag. This is the COALESCE path, and
+	// it is the one that would silently lose the provenance in production.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|prov-1", Source: "rooter", SourceIDs: []string{"rooter|prov-1"},
+		ID: str("prov-1"), Backend: str("sushi"), Key: str("pi-code"),
+		TS:           time.Date(2026, 11, 4, 11, 0, 0, 0, time.UTC),
+		PromptTokens: i64(72292), TotalMs: f64(4000),
+	}); err != nil {
+		t.Fatalf("re-pull without flag: %v", err)
+	}
+	var kept *bool
+	var computed *int64
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT runner_prompt_n_includes_cache, prompt_tokens_computed FROM calls WHERE call_id = $1`,
+		"rooter|prov-1").Scan(&kept, &computed); err != nil {
+		t.Fatalf("read prov-1 after the merge: %v", err)
+	}
+	if kept == nil || !*kept {
+		t.Errorf("the flag was %v after a merge that did not mention it, want true preserved - the flag is the only thing that makes the number beside it interpretable", kept)
+	}
+	if computed == nil || *computed != 742 {
+		t.Errorf("prompt_tokens_computed is %v after the merge, want 742 preserved", computed)
+	}
+
+	// And the coverage the store publishes has to separate the three states, because the whole point
+	// of the column is that a reader can tell which rows are arithmetic.
+	var withFlag, inclCache, equal int64
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT calls_with_prompt_n_flag, calls_with_prompt_n_including_cache,
+			calls_where_prompt_equals_cached_plus_computed
+		FROM call_quality WHERE backend = 'sushi'`).Scan(&withFlag, &inclCache, &equal); err != nil {
+		t.Fatalf("read call_quality: %v", err)
+	}
+	if withFlag != 1 || inclCache != 1 {
+		t.Errorf("sushi reports %v rows with the flag and %v including the cache, want 1/1 - the flag is set on exactly one row", withFlag, inclCache)
+	}
+	if equal < 1 {
+		t.Errorf("the equality count is %v, want at least 1: the sushi row satisfies cached + computed == prompt by construction and the store should show that as a tautology, not hide it", equal)
+	}
+	t.Logf("provenance: %d/%d sushi rows carry the flag, %d satisfy the equality (the equality is not evidence)", withFlag, inclCache, equal)
+}

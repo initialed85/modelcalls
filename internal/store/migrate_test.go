@@ -167,8 +167,13 @@ func TestCallsViewOnlyGainsColumnsAtTheEnd(t *testing.T) {
 	}
 
 	// The columns that were added after the first schema shipped, in the order they were added. A new
-	// column that is not listed here is a new column whose position has not been thought about.
-	added := []string{"engine_cache_hit_rate", "expert_cache_hit_rate", "first_content_ms", "first_content_gap_ms"}
+	// column that is not listed here is a new column whose position has not been thought about - and a
+	// column that is in the table but not in this list is a column no dashboard can see, which is how
+	// prompt_tokens_computed spent three migrations missing from the view while its replacement was
+	// being aggregated on.
+	added := []string{"prompt_tokens_computed", "engine_cache_hit_rate", "expert_cache_hit_rate",
+		"first_content_ms", "first_content_gap_ms", "runner_prompt_n_includes_cache",
+		"prompt_tokens_derived"}
 	if len(cols) < len(added) {
 		t.Fatalf("the calls view has %d columns, fewer than the %d that were added since the first schema", len(cols), len(added))
 	}
@@ -183,4 +188,61 @@ func TestCallsViewOnlyGainsColumnsAtTheEnd(t *testing.T) {
 		}
 	}
 	t.Logf("calls view: %d columns, appended in the order they were added: %v", len(cols), added)
+}
+
+// TestLegacyUpgradePathIsCurrent closes the one drift the lane cannot close for itself.
+//
+// The fresh path in .woodpecker/build.yaml enumerates migrations with a glob, so a new file is
+// applied automatically. The upgrade path cannot: test/legacy_upgrade_path.sql has to apply the frozen
+// snapshot FIRST and then the migrations in order, so its list is written with \ir and is therefore
+// hand-maintained. A migration added without being wired in there is a migration that is tested on
+// fresh databases and never on an installed one - which is exactly the coverage gap that produced the
+// two view-column failures, and a lane that is green while testing one fewer migration than the pod
+// runs is worse than no lane, because it is evidence.
+//
+// So this test reads the file and compares it to the embedded set. It is not a style check: the
+// assertion is that the same bytes, in the same order, are what the harvester would apply.
+func TestLegacyUpgradePathIsCurrent(t *testing.T) {
+	embedded, err := store.Migrations()
+	if err != nil {
+		t.Fatalf("Migrations: %v", err)
+	}
+
+	path := "../../test/legacy_upgrade_path.sql"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	text := string(raw)
+
+	// The snapshot is the whole point of the file, and a file that stopped applying it would silently
+	// become a fresh-install test wearing an upgrade test's name.
+	if !strings.Contains(text, `\ir legacy_schema_snapshot.sql`) {
+		t.Fatalf("the upgrade path no longer applies legacy_schema_snapshot.sql, so it is testing a fresh database and calling it an upgrade")
+	}
+
+	var got []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		const prefix = `\ir ../internal/store/migrations/`
+		if strings.HasPrefix(line, prefix) {
+			got = append(got, strings.TrimPrefix(line, prefix))
+		}
+	}
+
+	if len(got) != len(embedded) {
+		t.Errorf("the upgrade path applies %d migrations (%v) and the binary embeds %d (%v) - a migration that only ever runs on a fresh database is not a migration",
+			len(got), got, len(embedded), embedded)
+	}
+	for i := range embedded {
+		if i >= len(got) {
+			t.Errorf("the upgrade path stops at %d migrations; %s is never applied to an installed database", i, embedded[i])
+			continue
+		}
+		if got[i] != embedded[i] {
+			t.Errorf("the upgrade path applies %s at position %d, embedded order says %s - the order the harvester runs them in is the order this has to test",
+				got[i], i, embedded[i])
+		}
+	}
+	t.Logf("upgrade path applies %d migrations in embedded order: %v", len(got), got)
 }

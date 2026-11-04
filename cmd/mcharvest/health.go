@@ -88,6 +88,17 @@ type storeRow struct {
 	CallsWithFirstContentGap         int64
 	CallsWithNegativeFirstContentGap int64
 
+	// The provenance of the prompt numbers. Published as populations because the meaning of
+	// prompt_tokens_computed differs between engines: it is the runner's own number on strata and the
+	// router's subtraction on sushi, and the field that says which is the one that decides whether a
+	// cache-rate denominator is a measurement or arithmetic. The "flag present" count is kept apart
+	// from the "flag says yes" count, because an unanswered question is not a no.
+	CallsWithPromptNFlag                     int64
+	CallsWithPromptNIncludingCache           int64
+	CallsWithPromptDerivationFlag            int64
+	CallsWithDerivedPromptTokens             int64
+	CallsWherePromptEqualsCachedPlusComputed int64
+
 	// Means, per backend, and deliberately not summed. The mean of two per-backend means is not the
 	// mean over the calls, and publishing it under an unlabelled name is how a panel ends up averaging
 	// 60 calls from one box with 3 from another as if they were one population. The counts above are
@@ -103,6 +114,9 @@ func (r *storeRow) fields() []any {
 		&r.CallsWithUpstreamID, &r.CallsJoinedByContent, &r.CallsJoinedByTimingOnly,
 		&r.CallsWithUndefinedCacheRate, &r.CallsWithExpertCacheRate,
 		&r.CallsWithFirstContentMs, &r.CallsWithFirstContentGap, &r.CallsWithNegativeFirstContentGap,
+		&r.CallsWithPromptNFlag, &r.CallsWithPromptNIncludingCache,
+		&r.CallsWithPromptDerivationFlag, &r.CallsWithDerivedPromptTokens,
+		&r.CallsWherePromptEqualsCachedPlusComputed,
 		&r.MeanTTFTMs, &r.MeanFirstContentMs, &r.MeanFirstContentGap}
 }
 
@@ -115,6 +129,9 @@ func readCallQuality(ctx context.Context, db *sql.DB) ([]storeRow, error) {
 		calls_with_upstream_id, calls_joined_by_content, calls_joined_by_timing_only,
 		calls_with_undefined_cache_rate, calls_with_expert_cache_rate,
 		calls_with_first_content_ms, calls_with_first_content_gap, calls_with_negative_first_content_gap,
+		calls_with_prompt_n_flag, calls_with_prompt_n_including_cache,
+		calls_with_prompt_derivation_flag, calls_with_derived_prompt_tokens,
+		calls_where_prompt_equals_cached_plus_computed,
 		mean_ttft_ms, mean_first_content_ms, mean_first_content_gap_ms
 		FROM call_quality ORDER BY backend`)
 	if err != nil {
@@ -152,6 +169,11 @@ func total(rows []storeRow) storeRow {
 		t.CallsWithFirstContentMs += r.CallsWithFirstContentMs
 		t.CallsWithFirstContentGap += r.CallsWithFirstContentGap
 		t.CallsWithNegativeFirstContentGap += r.CallsWithNegativeFirstContentGap
+		t.CallsWithPromptNFlag += r.CallsWithPromptNFlag
+		t.CallsWithPromptNIncludingCache += r.CallsWithPromptNIncludingCache
+		t.CallsWithPromptDerivationFlag += r.CallsWithPromptDerivationFlag
+		t.CallsWithDerivedPromptTokens += r.CallsWithDerivedPromptTokens
+		t.CallsWherePromptEqualsCachedPlusComputed += r.CallsWherePromptEqualsCachedPlusComputed
 		// No mean is summed here, and that is the point: a total of means is a different quantity than
 		// a mean over rows, and the per-backend series are the ones that mean something.
 	}
@@ -183,6 +205,11 @@ var storeMetrics = []storeMetric{
 	{"calls_with_first_content_ms", "Rows with a first-content-token measurement at all. A mean over the gap is only honest next to this.", func(r storeRow) int64 { return r.CallsWithFirstContentMs }},
 	{"calls_with_first_content_gap", "Rows where BOTH halves of the thinking gap exist, i.e. the population any mean gap is taken from.", func(r storeRow) int64 { return r.CallsWithFirstContentGap }},
 	{"calls_with_negative_first_content_gap", "Rows where content was recorded BEFORE the first byte. A contradiction in one observer's clock, counted rather than rejected.", func(r storeRow) int64 { return r.CallsWithNegativeFirstContentGap }},
+	{"calls_with_prompt_n_flag", "Rows where the engine said what its prompt_n means. The complement is a backend whose numbers are being interpreted by assumption.", func(r storeRow) int64 { return r.CallsWithPromptNFlag }},
+	{"calls_with_prompt_n_including_cache", "Rows where prompt_n counts the prompt INCLUDING cached tokens, i.e. prompt_tokens_computed is the router's subtraction, not the runner's number.", func(r storeRow) int64 { return r.CallsWithPromptNIncludingCache }},
+	{"calls_with_prompt_derivation_flag", "Rows where the router said whether prompt_tokens is its own arithmetic. Zero until the router emits the field; a nonzero complement is a surface that has started saying.", func(r storeRow) int64 { return r.CallsWithPromptDerivationFlag }},
+	{"calls_with_derived_prompt_tokens", "Rows whose prompt_tokens is the router's addition of prompt_n + cached_n rather than a number read off the wire. Every cache-rate denominator in the store is one of these or an assumption.", func(r storeRow) int64 { return r.CallsWithDerivedPromptTokens }},
+	{"calls_where_prompt_equals_cached_plus_computed", "Rows where cached + computed == prompt. Reads like two measurements agreeing; on the rows where the router did the arithmetic it is a tautology. Published so the equality is never used as evidence without the flags beside it.", func(r storeRow) int64 { return r.CallsWherePromptEqualsCachedPlusComputed }},
 }
 
 // renderMetrics is the whole exposition, built as text so a test can assert on it without a scraper.

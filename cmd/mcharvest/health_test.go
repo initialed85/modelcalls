@@ -19,12 +19,23 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 			CallsJoinedAcrossSurfaces: 9, CallsWithUpstreamID: 54, CallsJoinedByContent: 9,
 			CallsWithUndefinedCacheRate: 0, CallsWithExpertCacheRate: 12,
 			CallsWithFirstContentMs: 30, CallsWithFirstContentGap: 29, CallsWithNegativeFirstContentGap: 1,
-			MeanTTFTMs: f64(140.5), MeanFirstContentMs: f64(30456.4), MeanFirstContentGap: f64(30315.9)},
+			// Strata's prompt_n is the work done this pass, so the flag is absent (unanswered) or false
+			// and the computed column is the runner's own number. The equality still holds on most rows,
+			// which is the trap: it is agreement there, not arithmetic.
+			CallsWithPromptNFlag: 14, CallsWithPromptNIncludingCache: 0,
+			CallsWithPromptDerivationFlag: 0, CallsWithDerivedPromptTokens: 0,
+			CallsWherePromptEqualsCachedPlusComputed: 55,
+			MeanTTFTMs:                               f64(140.5), MeanFirstContentMs: f64(30456.4), MeanFirstContentGap: f64(30315.9)},
 		// Sushi has no first-content measurement at all, which is the state worth testing: a mean over
 		// nothing must not be published as 0, because 0 is the number a panel reads as "no thinking".
+		// Every sushi row carries the flag and satisfies the equality, because on this engine the
+		// equality is the router's subtraction - 12 of 12 - so it is a tautology, not corroboration.
 		{Backend: "sushi", Calls: 12, CallsWithUsage: 12, CallsWithObservedTS: 0,
 			CallsJoinedAcrossSurfaces: 2, CallsWithUpstreamID: 12, CallsJoinedByTimingOnly: 2,
-			CallsWithFirstContentMs: 0, CallsWithFirstContentGap: 0},
+			CallsWithFirstContentMs: 0, CallsWithFirstContentGap: 0,
+			CallsWithPromptNFlag: 12, CallsWithPromptNIncludingCache: 12,
+			CallsWithPromptDerivationFlag: 0, CallsWithDerivedPromptTokens: 0,
+			CallsWherePromptEqualsCachedPlusComputed: 12},
 	}
 	counts := map[string]int{"insert": 40, "re_pull": 20, "unattributed": 1}
 	text := renderMetrics(rows, 7, time.Unix(1793761423, 0).UTC(), "", counts)
@@ -47,6 +58,14 @@ func TestRenderMetricsReportsTheStoreOwnWeaknesses(t *testing.T) {
 		`modelcalls_calls_with_first_content_gap{backend="sushi"} 0`,
 		`modelcalls_call_mean_first_content_gap_ms{backend="strata"} 30315.900000`,
 		`modelcalls_call_mean_ttft_ms{backend="strata"} 140.500000`,
+		// The prompt provenance, published as populations. The equality is deliberately the last of
+		// these: it is the number that looks like corroboration and is not, and it has to be readable
+		// only alongside the flags that explain it.
+		"modelcalls_calls_with_prompt_n_flag 26",
+		`modelcalls_calls_with_prompt_n_including_cache{backend="sushi"} 12`,
+		`modelcalls_calls_with_prompt_n_including_cache{backend="strata"} 0`,
+		"modelcalls_calls_with_derived_prompt_tokens 0",
+		`modelcalls_calls_where_prompt_equals_cached_plus_computed{backend="sushi"} 12`,
 		"modelcalls_harvest_cycles_total 7",
 		"modelcalls_harvest_last_cycle_timestamp_seconds 1793761423",
 		"modelcalls_harvest_last_cycle_ok 1",

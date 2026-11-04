@@ -640,8 +640,81 @@ BEGIN
  END;
 
 	-- J4. And the coverage the store reports has to distinguish "no thinking" from "never measured", or
-	-- the mean gap is computed over a population nobody can see.
+	-- the mean gap is computed over a population nobody can see. See step K's assertion for the same
+	-- argument applied to the provenance flags.
 	PERFORM 1;
+END $$;
+
+-- ══ step K: the prompt numbers say whose arithmetic they are ════════════════════════
+--
+-- This is the 005 contract, and it exists because of a real pair of rows on rooter's live ring:
+--
+--   sushi   prompt 72292  computed 742   cached 71550  prompt_n 72292  includes_cache true
+--   strata  prompt 60174  computed 140   cached 60034  prompt_n 140    includes_cache <absent>
+--
+-- Both satisfy cached + computed == prompt. On sushi that equation is a tautology - the router did the
+-- subtraction - and on strata it is two independent fields agreeing. The store's cache rates use
+-- prompt as the denominator, so the difference decides whether a rate is a measurement or an
+-- arithmetic identity, and the only thing that says which is the flag.
+DO $$
+DECLARE
+	r record;
+	n int;
+BEGIN
+	-- K1. Two rows, one per engine's actual shape, with the flags. The equality holds for both.
+	INSERT INTO call_events (event_key, source, source_ids, id, ts, backend, "key", status,
+		prompt_tokens, prompt_tokens_computed, cached_tokens, runner_prompt_n_includes_cache)
+	VALUES ('rooter|r-1011', 'rooter', '{rooter|r-1011}', 'r-1011',
+		'2026-11-04T09:30:00Z', 'sushi', 'pi-code', 200, 72292, 742, 71550, true),
+		('rooter|r-1012', 'rooter', '{rooter|r-1012}', 'r-1012',
+		'2026-11-04T09:30:01Z', 'strata', 'pi-code', 200, 60174, 140, 60034, false);
+
+	SELECT runner_prompt_n_includes_cache INTO r FROM call_events WHERE event_key = 'rooter|r-1011';
+	IF r.runner_prompt_n_includes_cache IS DISTINCT FROM true THEN
+		RAISE EXCEPTION 'K1: the engine''s flag did not survive the write, got %', r.runner_prompt_n_includes_cache;
+	END IF;
+
+	-- The equality is measured for both rows, and the flag is what separates them. If the store
+	-- published the equality and not the flag, a reader would see two corroborated measurements.
+	SELECT count(*) INTO n FROM call_events
+		WHERE prompt_tokens_computed = prompt_tokens - coalesce(cached_tokens, 0)
+			AND event_key IN ('rooter|r-1011', 'rooter|r-1012');
+	IF n <> 2 THEN
+		RAISE EXCEPTION 'K1: only % of the two rows satisfy cached + computed == prompt, so the contract rows are not the ones live data is', n;
+	END IF;
+	SELECT count(*) INTO n FROM call_events WHERE event_key IN ('rooter|r-1011', 'rooter|r-1012')
+		AND runner_prompt_n_includes_cache;
+	IF n <> 1 THEN
+		RAISE EXCEPTION 'K1: % of the two rows claim prompt_n includes the cache, want 1 - the flag is the only difference between a tautology and corroboration, and it is not being stored per row', n;
+	END IF;
+	RAISE NOTICE 'K1: right - both rows satisfy the equality, exactly one of them did the router''s arithmetic';
+
+	-- K2. Absent is not false. A row written by a surface that never said anything must read as NULL,
+	-- because "the engine did not tell us" and "the engine told us no" are different facts, and the
+	-- second one would let a panel conclude that every prompt_n on the store is a work count.
+	INSERT INTO call_events (event_key, source, source_ids, id, ts, backend, "key", status, prompt_tokens)
+	VALUES ('rooter|r-1013', 'rooter', '{rooter|r-1013}', 'r-1013',
+		'2026-11-04T09:30:02Z', 'sushi', 'pi-code', 200, 1000);
+	SELECT runner_prompt_n_includes_cache, prompt_tokens_derived INTO r
+		FROM call_events WHERE event_key = 'rooter|r-1013';
+	IF r.runner_prompt_n_includes_cache IS NOT NULL OR r.prompt_tokens_derived IS NOT NULL THEN
+		RAISE EXCEPTION 'K2: a row whose surface said nothing got % / %; an unknown has to stay NULL',
+			r.runner_prompt_n_includes_cache, r.prompt_tokens_derived;
+	END IF;
+
+	-- K3. And a merge that does not mention the flag must not clear it. This is the shape that loses the
+	-- flag in practice: the surface that knows the semantics is usually not the surface that reports the
+	-- call again. The store's own COALESCE merge is what guarantees this, and it is tested in Go against
+	-- the real upsert; here it is the same property at the SQL level, using a write that changes a
+	-- different column and leaves the flag alone. The write touches timings only - changing a prompt
+	-- count here would move the arithmetic K4 checks, which is exactly the confusion this migration is
+	-- about and is not what this step is asserting.
+	UPDATE call_events SET prompt_ms = 12.0, total_ms = 4000.0 WHERE event_key = 'rooter|r-1011';
+	SELECT runner_prompt_n_includes_cache INTO r FROM call_events WHERE event_key = 'rooter|r-1011';
+	IF r.runner_prompt_n_includes_cache IS DISTINCT FROM true THEN
+		RAISE EXCEPTION 'K3: a merge that said nothing about the flag cleared it to %; the flag is the only thing that makes the number beside it readable', r.runner_prompt_n_includes_cache;
+	END IF;
+	RAISE NOTICE 'K3: right - the flag survives a write that does not mention it';
 END $$;
 
 DO $$
@@ -655,6 +728,28 @@ BEGIN
 	RAISE NOTICE 'J4: coverage - % of % sushi rows have a first-content measurement, mean ttft %, mean first content %, mean gap %',
 		r.calls_with_first_content_ms, r.calls,
 		r.mean_ttft_ms, r.mean_first_content_ms, r.mean_first_content_gap_ms;
+
+	-- K4. The same population argument for the provenance flags, and the reason the equality gets its
+	-- own count: a reader who sees calls_where_prompt_equals_cached_plus_computed = 100 and concludes
+	-- that 100 measurements agree has been told nothing about how many of them are arithmetic.
+	SELECT * INTO r FROM call_quality WHERE backend = 'sushi';
+	IF r.calls_with_prompt_n_flag = 0 THEN
+		RAISE EXCEPTION 'K4: call_quality reports no prompt_n flag coverage for sushi, so the meaning of prompt_tokens_computed is an assumption a panel cannot see';
+	END IF;
+	IF r.calls_with_prompt_n_including_cache = 0 THEN
+		RAISE EXCEPTION 'K4: no sushi row is counted as including the cache in prompt_n, so the subtraction is invisible in the coverage';
+	END IF;
+	IF r.calls_where_prompt_equals_cached_plus_computed < r.calls_with_prompt_n_including_cache THEN
+		RAISE EXCEPTION 'K4: % rows satisfy the equality but % claim the router did the arithmetic, which cannot be - the arithmetic rows satisfy it by construction',
+			r.calls_where_prompt_equals_cached_plus_computed, r.calls_with_prompt_n_including_cache;
+	END IF;
+	IF r.calls_with_prompt_derivation_flag = 0 THEN
+		RAISE NOTICE 'K4: right - no row carries prompt_tokens_derived yet, which is the honest state: the router has not started saying it, and the store reports that as 0 rather than as a yes';
+	ELSE
+		RAISE NOTICE 'K4: coverage - % of % sushi rows have a prompt_n flag, % include the cache, % carry the derivation flag, % satisfy the equality',
+			r.calls_with_prompt_n_flag, r.calls, r.calls_with_prompt_n_including_cache,
+			r.calls_with_prompt_derivation_flag, r.calls_where_prompt_equals_cached_plus_computed;
+	END IF;
 END $$;
 
 ROLLBACK;

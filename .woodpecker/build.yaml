@@ -42,16 +42,19 @@ steps:
       # identical to a lane that is merely slow.
       - for i in $(seq 1 60); do pg_isready -h postgres -U mc -d modelcalls && break; sleep 1; done
       - pg_isready -h postgres -U mc -d modelcalls
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/004_first_content.sql
+      # Enumerated, not listed. Every migration in this repo is applied in name order by the Go
+      # harness, which reads them from an embedded directory glob - so a lane that hardcodes the list
+      # drifts the moment somebody adds a file, and it drifts silently: the lane stays green while
+      # testing one fewer migration than production runs. Adding 005 is exactly the change that would
+      # have been missed.
+      #
+      # `ls` rather than a bare glob because these steps run under sh in the service's companion
+      # image, and an unmatched glob would hand the literal pattern to psql. Fails loudly, which is
+      # the correct outcome for an empty migrations directory.
+      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate: $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
       # Second pass over the same database. Every migration in this repo claims to be safe to re-apply;
       # this is where that claim is tested rather than asserted in a comment.
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/001_initial.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/002_join_tiers.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/003_usage_semantics.sql
-      - psql -v ON_ERROR_STOP=1 -f internal/store/migrations/004_first_content.sql
+      - for f in $(ls internal/store/migrations/*.sql | sort); do echo "migrate again: $f"; psql -v ON_ERROR_STOP=1 -f "$f"; done
       # The scenarios twice as well: they assert the contract from a known state, and half of them are
       # "this statement must fail", which is only meaningful if it still fails on a database that has
       # already been through them.
@@ -68,6 +71,11 @@ steps:
       # the next one stops.
       - psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS modelcalls_upgrade"
       - psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE modelcalls_upgrade"
+      # The file applies the frozen snapshot and then the migrations itself, in order, because the
+      # order matters and the snapshot has to be applied first. It is a hardcoded \ir list, which is
+      # precisely the drift the fresh path above avoids with a glob - so TestLegacyUpgradePathIsCurrent
+      # cross-checks it against the embedded migration set and fails if a migration is added without
+      # being wired into the upgrade path.
       - psql -v ON_ERROR_STOP=1 -d modelcalls_upgrade -f test/legacy_upgrade_path.sql
 
   - name: go-contract

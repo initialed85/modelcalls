@@ -85,20 +85,33 @@ type rooterRecord struct {
 	FirstContentMs *float64 `json:"first_content_ms"`
 	TotalMs        float64  `json:"total_ms"`
 	PromptTokens   *int64   `json:"prompt_tokens"`
-	// Rooter publishes its own arithmetic answer for the prompt length next to llama.cpp's reported
-	// count, because prompt_n is not the whole prompt. Live: prompt_tokens 98060,
-	// prompt_tokens_computed 98060, extra.prompt_n 98060. It is stored as its own column and never
-	// substituted for the reported number.
-	PromptTokensComputed *int64          `json:"prompt_tokens_computed"`
-	CompletionTokens     *int64          `json:"completion_tokens"`
-	CachedTokens         *int64          `json:"cached_tokens"`
-	PrefillMs            *float64        `json:"prefill_ms"`
-	PrefillTokS          *float64        `json:"prefill_tok_s"`
-	DecodeMs             *float64        `json:"decode_ms"`
-	DecodeTokS           *float64        `json:"decode_tok_s"`
-	CacheHitRate         *float64        `json:"cache_hit_rate"`
-	FinishReason         string          `json:"finish_reason"`
-	Extra                json.RawMessage `json:"extra"`
+	// Rooter publishes its own arithmetic answer for the prompt length next to the reported count.
+	// Which of the two is the runner's raw number varies by engine, and the flag below is what says so:
+	// strata's prompt_n is the work done this pass (computed == prompt_n verbatim), sushi's is the full
+	// length (computed == prompt_n - cached_n). Live, all 71 rows with a prompt count: 14 strata
+	// verbatim / 57 sushi subtractive. Stored as its own column and never substituted for the reported
+	// number.
+	PromptTokensComputed *int64 `json:"prompt_tokens_computed"`
+	// RunnerPromptNIncludesCache is the engine's own statement about what its prompt_n means: true when
+	// it counts the prompt INCLUDING whatever was served from cache. This is the field that decides
+	// whether the column above is a measurement or a subtraction, and the store was dropping it - the
+	// same shape of loss as first_content_ms, which this file already documents. It is present and true
+	// on sushi rows, absent on strata's.
+	RunnerPromptNIncludesCache *bool `json:"runner_prompt_n_includes_cache"`
+	// PromptTokensDerived is rooter's declaration of whether PromptTokens is its own addition of
+	// prompt_n + cached_n rather than a number read off the wire. It does not exist yet (0 of 71 live
+	// rows carry it); the field is here so the store has somewhere to put it the moment it does, and
+	// NULL means the surface has not said, never "not derived".
+	PromptTokensDerived *bool           `json:"prompt_tokens_derived"`
+	CompletionTokens    *int64          `json:"completion_tokens"`
+	CachedTokens        *int64          `json:"cached_tokens"`
+	PrefillMs           *float64        `json:"prefill_ms"`
+	PrefillTokS         *float64        `json:"prefill_tok_s"`
+	DecodeMs            *float64        `json:"decode_ms"`
+	DecodeTokS          *float64        `json:"decode_tok_s"`
+	CacheHitRate        *float64        `json:"cache_hit_rate"`
+	FinishReason        string          `json:"finish_reason"`
+	Extra               json.RawMessage `json:"extra"`
 }
 
 // Pull reads everything after the cursor and advances it. An error leaves the cursor where it was,
@@ -203,6 +216,11 @@ func (r *Rooter) event(rec rooterRecord) store.Event {
 	}
 	ev.PromptTokens = rec.PromptTokens
 	ev.PromptTokensComputed = rec.PromptTokensComputed
+	// The two provenance flags travel with the numbers they describe. A NULL is kept as NULL: the
+	// difference between "the engine did not say" and "the engine said no" is the difference between
+	// an unknown and a fact, and call_quality counts them apart.
+	ev.RunnerPromptNIncludesCache = rec.RunnerPromptNIncludesCache
+	ev.PromptTokensDerived = rec.PromptTokensDerived
 	ev.CompletionTokens = rec.CompletionTokens
 	ev.CachedTokens = rec.CachedTokens
 	// rooter calls it prefill_ms, strata calls it prompt_ms, and the schema has one column because it

@@ -130,7 +130,14 @@ func TestRooterPull(t *testing.T) {
 		     "prompt_tokens": 98060, "prompt_tokens_computed": 98389,
 		     "finish_reason": "stop", "extra": {"raw": {"note": "tail empty"}}},
 		    {"id": "r-2", "ts": "not-a-time", "path": "/v1/models", "method": "GET", "kind": "read",
-		     "key": "pi-code", "key_source": "header", "backend": "", "status": 401, "bytes": 91}
+		     "key": "pi-code", "key_source": "header", "backend": "", "status": 401, "bytes": 91},
+		    {"id": "r-3", "upstream_id": "chatcmpl-sushi", "ts": "2026-11-04T03:04:43.664Z",
+		     "path": "/v1/chat/completions", "method": "POST", "kind": "gen", "key": "pi-code",
+		     "key_source": "header", "backend": "sushi", "alias": "sushi", "profile": "q8_0",
+		     "model": "qwen3.8-flash-next-q8_0", "stream": true, "status": 200, "bytes": 9000,
+		     "wait_ms": 1.8, "ttft_ms": 24.0, "first_content_ms": 488.7, "total_ms": 12027.0,
+		     "prompt_tokens": 72292, "prompt_tokens_computed": 742, "cached_tokens": 71550,
+		     "runner_prompt_n_includes_cache": true, "completion_tokens": 448}
 		  ]}`))
 	}))
 	defer srv.Close()
@@ -140,8 +147,8 @@ func TestRooterPull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pull: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %d, want 2", len(events))
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3", len(events))
 	}
 	if ro.Cursor != 77 {
 		t.Errorf("cursor = %d, want the envelope's 77", ro.Cursor)
@@ -159,6 +166,25 @@ func TestRooterPull(t *testing.T) {
 	}
 	if ev.PromptTokensComputed == nil || *ev.PromptTokensComputed != 98389 {
 		t.Errorf("prompt_tokens_computed = %v, want rooter's computed 98389 kept separate", ev.PromptTokensComputed)
+	}
+
+	// The provenance flags, at the boundary where they are easiest to lose. Strata's ring row does not
+	// say anything about its prompt_n, so the correct answer is nil - NOT false, which would record
+	// "the engine's prompt count excludes the cache" as a fact the engine never stated. Sushi's row
+	// says true, and the store's whole purpose is that this is the difference between the computed
+	// column being a measurement and being the router's own subtraction.
+	if ev.RunnerPromptNIncludesCache != nil {
+		t.Errorf("strata runner_prompt_n_includes_cache = %v, want nil: this surface did not answer, and an unknown must stay unknown through the translator too", *ev.RunnerPromptNIncludesCache)
+	}
+	if ev.PromptTokensDerived != nil {
+		t.Errorf("strata prompt_tokens_derived = %v, want nil", *ev.PromptTokensDerived)
+	}
+	sushi := events[2]
+	if sushi.RunnerPromptNIncludesCache == nil || !*sushi.RunnerPromptNIncludesCache {
+		t.Errorf("sushi runner_prompt_n_includes_cache = %v, want true - the flag is the only thing that says prompt_tokens_computed is a subtraction", sushi.RunnerPromptNIncludesCache)
+	}
+	if sushi.FirstContentMs == nil || *sushi.FirstContentMs != 488.7 {
+		t.Errorf("sushi first_content_ms = %v, want 488.7", sushi.FirstContentMs)
 	}
 	if ev.UpstreamID == nil || *ev.UpstreamID != "chatcmpl-xyz" {
 		t.Errorf("upstream_id = %v, want chatcmpl-xyz: it is the only join key that means the same thing to both sides", ev.UpstreamID)

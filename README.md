@@ -141,12 +141,29 @@ Once strata exposes that id, this source sets `UpstreamID`, the join becomes pat
   first-class column becomes a legend that lies; an explained one gets a name that stops the next reader
   conflating it. A 107k-token prompt can be ~99% prompt-reused and ~86% expert-resident at the same
   time, both true, and one "cache hit rate" column would make one of those sentences false.
-- **`prompt_tokens_computed` is kept apart from `prompt_tokens`.** llama.cpp reports `prompt_n`; rooter
-  publishes its arithmetic answer beside it rather than replacing it, and this table does the same.
-  Live from rooter's ring: `prompt_tokens 98060`, `prompt_tokens_computed 98060`, `extra.prompt_n 98060`
-  — equal, which is the boring case. Collapsing the two would destroy the only evidence of how often
-  they are not, and a computed estimate never becomes a reported count: a row with only a computed
-  prompt keeps `has_usage = false` and stays out of token aggregates.
+- **`prompt_tokens_computed` is kept apart from `prompt_tokens`, and `runner_prompt_n_includes_cache`
+  says which of them is arithmetic.** llama.cpp reports `prompt_n`; rooter publishes its arithmetic
+  answer beside it rather than replacing it, and this table does the same. The two are *not* always
+  equal, and the difference is per-backend, measured on the live store rather than reasoned about:
+  on strata `prompt_tokens_computed` is the runner's own `prompt_n` (the tokens it evaluated this
+  pass), so `prompt_tokens - cached_tokens` is the gap between two measurements. On sushi the engine
+  says its `prompt_n` is the prompt **including** what the prefix cache served, so `prompt_tokens`
+  is the full length and `prompt_tokens_computed` is `prompt_n - cached_n` — the router's subtraction,
+  not a measurement at all. `cached_tokens + prompt_tokens_computed == prompt_tokens` holds on every
+  row either way, which is exactly why it is not evidence: on the sushi rows one of the three numbers
+  was computed from the other two. Read the flag, not the equality.
+  The store's own history is the cautionary case: 174 sushi rows from 04:58–06:20 on 2026-11-04 have
+  `computed == prompt` with a large `cached_tokens`, and 140 rows from 06:34 onward have `computed ==
+  prompt - cached`. Rooter's subtraction moved into that column during the day, under one name, and
+  `version` is NULL on every row so it cannot be attributed to a build. A computed estimate never
+  becomes a reported count either way: a row with only a computed prompt keeps `has_usage = false`
+  and stays out of token aggregates.
+- **`prompt_tokens_derived` is the same question from the other side**: whether `prompt_tokens` itself
+  is a wire number or `prompt_n + cached_n` that rooter added. Rooter does not publish it yet, so the
+  column is NULL everywhere and the store reports that as 0 rows rather than as "not derived". It is
+  a column rather than a reading of `extra` because it is load-bearing for the denominator of every
+  cache rate in the table, and a dashboard should be able to ask how much of its denominator is
+  arithmetic without parsing a JSON blob.
 - **`usage_source` names the mechanism, not the component**: `none | client | injected |
   runner_scrape`. `injected` means a usage frame exists because the observer added
   `include_usage=true` — measurement affecting the measurement, worth knowing when you read the
@@ -171,6 +188,8 @@ Once strata exposes that id, this source sets `UpstreamID`, the join becomes pat
   `calls_with_first_content_gap` so the mean's population is visible next to the mean. One observer's
   clock being ahead of another's produces a negative gap; that is counted
   (`calls_with_negative_first_content_gap`), not rejected.
+  In the store now: 226 of 628 rows have a gap, mean 4.9s on strata and 3.5s on sushi. That is the
+  thinking cost of a typical call, which no panel in this system could see until it was a column.
 - **`call_quality` reports the store's own weaknesses as data**: `calls_without_usage`,
   `calls_joined_by_content`, `calls_joined_by_timing_only`, `calls_with_undefined_cache_rate`,
   `calls_with_observed_ts`. Any panel built on `calls` can be asked how much of its number depends on a

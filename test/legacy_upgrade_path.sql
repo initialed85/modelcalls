@@ -42,6 +42,7 @@ VALUES ('rooter|r-legacy-1', 'rooter', ARRAY['rooter|r-legacy-1']::text[], 'r-le
 \ir ../internal/store/migrations/002_join_tiers.sql
 \ir ../internal/store/migrations/003_usage_semantics.sql
 \ir ../internal/store/migrations/004_first_content.sql
+\ir ../internal/store/migrations/005_prompt_provenance.sql
 
 -- ══ the assertions ═══════════════════════════════════════════════════════════════════
 BEGIN;
@@ -53,7 +54,8 @@ BEGIN
 	-- 1. Columns were ADDED. A migration that renames or renumbers a column on a database with rows in
 	-- it is a migration that loses data, and "IF NOT EXISTS" is what says so.
 	FOREACH c IN ARRAY ARRAY['prompt_tokens_computed', 'cache_rate_undefined',
-		'engine_cache_hit_rate', 'expert_cache_hit_rate', 'first_content_ms', 'first_content_gap_ms']
+		'engine_cache_hit_rate', 'expert_cache_hit_rate', 'first_content_ms', 'first_content_gap_ms',
+		'runner_prompt_n_includes_cache', 'prompt_tokens_derived']
 	LOOP
 		IF NOT EXISTS (SELECT 1 FROM information_schema.columns
 			WHERE table_schema = 'public' AND table_name = 'call_events' AND column_name = c) THEN
@@ -81,17 +83,20 @@ BEGIN
 
 	-- The additions have to be the LAST columns, in the order they were added. That is the whole
 	-- constraint, and the fact that this view was replaced at all proves the columns before them kept
-	-- their positions: CREATE OR REPLACE VIEW refuses any other change to an existing column.
+	-- their positions: a replacement refuses any other change to an existing column. prompt_tokens_computed
+	-- is one of the seven because it was added after the first schema shipped, and it reached the view
+	-- only with the provenance pair that explains it - see the note in 001.
 	SELECT array_agg(x.column_name ORDER BY x.ordinal_position) INTO tail_cols
 		FROM (SELECT column_name, ordinal_position FROM information_schema.columns
-			WHERE table_name = 'calls' ORDER BY ordinal_position DESC LIMIT 4) x;
-	IF tail_cols <> ARRAY['engine_cache_hit_rate', 'expert_cache_hit_rate', 'first_content_ms',
-		'first_content_gap_ms'] THEN
-		RAISE EXCEPTION 'upgrade: the last four columns of calls are %, and they should be the four added since the first schema - anything else means a new column was inserted before existing ones, and Postgres only accepts additions at the end', tail_cols;
+			WHERE table_name = 'calls' ORDER BY ordinal_position DESC LIMIT 7) x;
+	IF tail_cols <> ARRAY['prompt_tokens_computed', 'engine_cache_hit_rate', 'expert_cache_hit_rate',
+		'first_content_ms', 'first_content_gap_ms', 'runner_prompt_n_includes_cache',
+		'prompt_tokens_derived'] THEN
+		RAISE EXCEPTION 'upgrade: the last seven columns of calls are %, and they should be the seven added since the first schema - anything else means a new column was inserted before existing ones, and Postgres only accepts additions at the end', tail_cols;
 	END IF;
 
 	SELECT count(*) INTO n FROM information_schema.columns WHERE table_name = 'calls';
-	RAISE NOTICE 'upgrade: right - calls now has % columns, and the four newest are the four that were added since the first schema, in order', n;
+	RAISE NOTICE 'upgrade: right - calls now has % columns, and the seven newest are the seven that were added since the first schema, in the order they were added', n;
 END $$;
 
 DO $$
@@ -108,10 +113,17 @@ BEGIN
 	IF r.join_method <> 'backend_key_window' THEN
 		RAISE EXCEPTION 'upgrade: a pre-upgrade row reports join_method %; the constraint swap rewrote history it should not touch', r.join_method;
 	END IF;
-	IF r.first_content_ms IS NOT NULL OR r.first_content_gap_ms IS NOT NULL THEN
+	if r.first_content_ms IS NOT NULL OR r.first_content_gap_ms IS NOT NULL THEN
 		RAISE EXCEPTION 'upgrade: a call that predates the first-content columns has a measurement of % / %', r.first_content_ms, r.first_content_gap_ms;
 	END IF;
-	RAISE NOTICE 'upgrade: right - the pre-upgrade row is intact: % on % measured % ms total, with no thinking gap because nobody measured one',
+	-- The provenance pair must be NULL on a row that predates them, and specifically not FALSE. A
+	-- migration that defaults an unknown to "no" turns every pre-upgrade call into a claim that the
+	-- engine said its prompt_n excludes the cache, which is a statement nobody made.
+	IF r.runner_prompt_n_includes_cache IS NOT NULL OR r.prompt_tokens_derived IS NOT NULL THEN
+		RAISE EXCEPTION 'upgrade: a call that predates the provenance columns reports % / %; an unknown must stay NULL, not become false',
+			r.runner_prompt_n_includes_cache, r.prompt_tokens_derived;
+	END IF;
+	RAISE NOTICE 'upgrade: right - the pre-upgrade row is intact: % on % measured % ms total, with no thinking gap because nobody measured one, and both provenance flags NULL because nobody said anything',
 		r.join_method, r.backend, r.total_ms;
 END $$;
 
@@ -164,7 +176,12 @@ BEGIN
 	END IF;
 	FOREACH c IN ARRAY ARRAY['calls_with_first_content_ms',
 		'calls_with_first_content_gap', 'mean_first_content_ms', 'mean_first_content_gap_ms',
-		'calls_with_negative_first_content_gap']
+		'calls_with_negative_first_content_gap',
+		-- The provenance populations. If these are missing, the store can hold the flags and no panel
+		-- can see how much of its denominator is arithmetic, which is the failure the flags exist for.
+		'calls_with_prompt_n_flag', 'calls_with_prompt_n_including_cache',
+		'calls_with_prompt_derivation_flag', 'calls_with_derived_prompt_tokens',
+		'calls_where_prompt_equals_cached_plus_computed']
 	LOOP
 		SELECT count(*) INTO n FROM information_schema.columns
 			WHERE table_name = 'call_quality' AND column_name = c;
@@ -172,7 +189,52 @@ BEGIN
 			RAISE EXCEPTION 'upgrade: call_quality is missing %, so the metric a panel would read does not exist', c;
 		END IF;
 	END LOOP;
-	RAISE NOTICE 'upgrade: call_quality carries the renamed tier counts and the first-content coverage';
+	RAISE NOTICE 'upgrade: call_quality carries the renamed tier counts, the first-content coverage, and the prompt-provenance populations';
+END $$;
+
+DO $$
+DECLARE
+	r record;
+	n int;
+BEGIN
+	-- 6. The flags are writable on an upgraded table, readable through the view, and counted - and the
+	-- tautology count is separated from them, because that is the whole point of 005. Two rows, one
+	-- per engine's actual shape, taken from live rooter records on 2026-11-04:
+	--   sushi: prompt_n IS the full length, so prompt_tokens_computed is the router's subtraction.
+	--   strata: prompt_n is the work done, so prompt_tokens_computed is the runner's own number.
+	-- Both satisfy cached + computed == prompt. Only the flag says which kind of row you are looking at.
+	INSERT INTO call_events (event_key, source, source_ids, id, ts, backend, status, ttft_ms,
+		prompt_tokens, prompt_tokens_computed, cached_tokens, runner_prompt_n_includes_cache,
+		prompt_tokens_derived)
+	VALUES ('rooter|r-legacy-3', 'rooter', ARRAY['rooter|r-legacy-3']::text[], 'r-legacy-3',
+		'2026-11-04T12:00:00Z', 'sushi', 200, 30.0, 72292, 742, 71550, true, false),
+		('rooter|r-legacy-4', 'rooter', ARRAY['rooter|r-legacy-4']::text[], 'r-legacy-4',
+		'2026-11-04T12:00:01Z', 'strata', 200, 30.0, 60174, 140, 60034, false, true);
+
+	SELECT runner_prompt_n_includes_cache, prompt_tokens_derived INTO r
+		FROM calls WHERE call_id = 'rooter|r-legacy-3';
+	IF r.runner_prompt_n_includes_cache IS DISTINCT FROM true
+		OR r.prompt_tokens_derived IS DISTINCT FROM false THEN
+		RAISE EXCEPTION 'upgrade: the provenance flags did not survive the round trip through calls on an upgraded table: got % / %',
+			r.runner_prompt_n_includes_cache, r.prompt_tokens_derived;
+	END IF;
+
+	-- The two rows agree with the same arithmetic, and the flag is the only difference between them.
+	-- If this count is not 2, the equality is not being measured the way the columns are, and a panel
+	-- would be told that one of these rows is corroborated and the other is not.
+	SELECT calls_where_prompt_equals_cached_plus_computed INTO n FROM call_quality WHERE backend = 'sushi';
+	IF n <> 1 THEN
+		RAISE EXCEPTION 'upgrade: the equality count on sushi is %, expected 1 (72292 = 71550 + 742) - the FILTER is not matching the rows that satisfy it', n;
+	END IF;
+	SELECT calls_with_prompt_n_including_cache INTO n FROM call_quality WHERE backend = 'sushi';
+	IF n <> 1 THEN
+		RAISE EXCEPTION 'upgrade: sushi reports % rows as including the cache in prompt_n, want 1 - the subtraction is invisible to a reader without it', n;
+	END IF;
+	SELECT calls_with_derived_prompt_tokens INTO n FROM call_quality WHERE backend = 'strata';
+	IF n <> 1 THEN
+		RAISE EXCEPTION 'upgrade: strata''s derived-prompt row is counted as % , want 1 - a panel cannot see that its denominator is arithmetic', n;
+	END IF;
+	RAISE NOTICE 'upgrade: right - the flags survive an upgrade, and the equality that looks like corroboration is counted separately from the flags that explain it';
 END $$;
 
 ROLLBACK;

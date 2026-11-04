@@ -181,14 +181,39 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- 'injected'. So the mechanism is recorded when a surface can state it and 'none' when it cannot -
 	-- which for rooter's ring today means 'none', because its records carry no provenance field.
 	prompt_tokens integer check (prompt_tokens is null or prompt_tokens >= 0),
-	-- prompt_tokens_computed exists because llama.cpp's `prompt_n` is not the whole prompt. rooter
-	-- publishes its own arithmetic answer beside the reported count rather than replacing it, and so
-	-- does this table: the two are separate columns, and a reader can see which calls the runner
-	-- under-reported. Collapsing them would destroy the only evidence of how often that happens.
-	-- Live from rooter's ring: prompt_tokens 98060 with prompt_tokens_computed 98060 and extra.prompt_n
-	-- 98060 - equal here, and that is a measurement, not an assumption; the columns stay apart so the
-	-- unequal cases are visible instead of averaged.
+	-- prompt_tokens_computed exists because the number a runner calls "prompt" is not always the same
+	-- number as the length of the prompt. rooter publishes its own arithmetic answer beside the
+	-- reported count rather than replacing it, and so does this table: the two are separate columns,
+	-- and a reader can see which calls were under-reported. Collapsing them would destroy the only
+	-- evidence of how often that happens.
+	--
+	-- Which of the two is the arithmetic VARIES BY ENGINE, and that is the reason for the two
+	-- provenance columns below. Live from rooter's ring, 2026-11-04, all 71 rows with a prompt count:
+	--   strata (14):  prompt_tokens_computed == extra.prompt_n verbatim. Strata's prompt_n is the
+	--                 tokens it evaluated this pass, so the gap between the two columns is the
+	--                 runner's own statement about its cache.
+	--   sushi  (57):  extra.prompt_n == prompt_tokens (the FULL length - the engine says so, via
+	--                 runner_prompt_n_includes_cache) and prompt_tokens_computed == prompt_n -
+	--                 cached_n. Here the computed column is the router's subtraction.
+	-- cached_tokens + prompt_tokens_computed == prompt_tokens holds in all 71, which reads like two
+	-- independent measurements agreeing and in 57 of them is arithmetic. Read the flag, not the
+	-- equality.
+	--
+	-- And the ring is not the history. The 628 rows the harvester has KEPT show this same column meaning
+	-- two different things on the same backend, split by time:
+	--   174 sushi rows, 04:58-06:20   prompt_tokens_computed == prompt_tokens, cached_tokens large
+	--   140 sushi rows, 06:34-07:21   prompt_tokens_computed == prompt_tokens - cached_tokens
+	-- So rooter's subtraction moved into this column during the day, and the 71-row sample above is
+	-- entirely post-cutover because the ring holds 60 minutes and had already rolled past the rest.
+	-- `version` is NULL on every one of those rows, so the change cannot be attributed to a build. The
+	-- 174 are permanently ambiguous - the flag did not exist when they were written. This is what the
+	-- store's insistence on provenance-over-inference is for.
 	prompt_tokens_computed integer check (prompt_tokens_computed is null or prompt_tokens_computed >= 0),
+	-- The engine's own statement about what its prompt_n means, and the router's about whether
+	-- prompt_tokens is its own addition. Both NULL when the surface did not say - never FALSE, which
+	-- would launder an unknown into a fact. See 005.
+	runner_prompt_n_includes_cache boolean,
+	prompt_tokens_derived boolean,
 	completion_tokens integer check (completion_tokens is null or completion_tokens >= 0),
 
 	-- cached_tokens is the wire/usage view (what the runner billed as cached). engine_cached_tokens
@@ -451,9 +476,10 @@ CREATE TRIGGER call_events_rates BEFORE INSERT OR UPDATE ON call_events
 -- been running fine for a month. A fresh database never sees this; an installed one hits it on the
 -- first restart after a migration is added, which is the worst possible time.
 --
--- The definitions here are byte-for-byte the ones in 003 and 004. That duplication is deliberate and
--- load-bearing: if they drifted, this file would create a column the later file then refuses to accept,
--- or the reverse. 003 and 004 each verify what actually landed in the database they just ran against.
+-- The definitions here are byte-for-byte the ones in 003, 004 and 005. That duplication is deliberate
+-- and load-bearing: if they drifted, this file would create a column the later file then refuses to
+-- accept, or the reverse. 003, 004 and 005 each verify what actually landed in the database they just
+-- ran against.
 DO $$
 BEGIN
 	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS
@@ -478,6 +504,9 @@ BEGIN
 		first_content_ms double precision check (first_content_ms is null or first_content_ms >= 0);
 	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS first_content_gap_ms double precision
 		GENERATED ALWAYS AS (first_content_ms - ttft_ms) STORED;
+	-- 005's pair, same reason: the view and call_quality below both reference them.
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS runner_prompt_n_includes_cache boolean;
+	ALTER TABLE call_events ADD COLUMN IF NOT EXISTS prompt_tokens_derived boolean;
 END $$;
 
 -- ─── calls: the view dashboards should read ────────────────────────────────────────────
@@ -540,11 +569,11 @@ SELECT
 	total_ms,
 	join_method,
 	-- Everything added since the first schema shipped is appended HERE and nowhere else, and that is a
-	-- requirement rather than tidiness. `calls` is created with CREATE OR REPLACE VIEW, and Postgres will
-	-- add columns to an existing view only at the end, in order; it refuses to change the name or
-	-- position of a column the view already has. So these four are what a database created before them
-	-- can accept, and the same four slotted into the middle of the list is a migration that fails at
-	-- process start - which is exactly where 001 runs, because the harvester migrates before it serves.
+	-- requirement rather than tidiness. Postgres will add columns to an existing view only at the end,
+	-- in order; it refuses to change the name or position of a column the view already has. So these
+	-- seven are what a database created before them can accept, and the same seven slotted into the
+	-- middle of the list is a migration that fails at process start - which is exactly where 001 runs,
+	-- because the harvester migrates before it serves.
 	--
 	-- Measured, not predicted, twice over. first_content_ms in the middle killed a store that had been
 	-- running for a day ("cannot change name of view column prompt_ms to first_content_ms"). And
@@ -554,13 +583,31 @@ SELECT
 	-- shape from a frozen snapshot and migrates it forward, so the next column added in the wrong place
 	-- fails a lane instead of a deploy.
 	--
+	-- The view is DROP + CREATE now, which removes the positional failure entirely. The ordering rule
+	-- survives it, for two reasons: the ALTERs in the DO block above have no other option, so a fresh
+	-- database and an upgraded one agree on the TABLE's order only if additions go last here too; and
+	-- the rule is what keeps the two shapes interchangeable, which is the thing that actually broke.
+	--
 	-- What this rule costs is that the view's column order is historical rather than logical, and a
 	-- reader who wants cached_tokens next to cache_hit_rate cannot have them. That is the right trade:
 	-- order here is cosmetic, and a migration that only works on an empty database is not a migration.
+	--
+	-- prompt_tokens_computed is in this tail although it is a 003 column, and it was missing from this
+	-- view entirely until the provenance pair was added - which is how the omission got noticed: the
+	-- view was about to expose the field that says whether the computed count is a measurement or a
+	-- subtraction, without the computed count. A projection that shows the explanation and hides the
+	-- thing explained is worse than showing neither, because it invites a reader to believe they have
+	-- been told something. It is first in the tail because it was added first.
+	prompt_tokens_computed,
 	engine_cache_hit_rate,
 	expert_cache_hit_rate,
 	first_content_ms,
-	first_content_gap_ms
+	first_content_gap_ms,
+	-- The provenance pair, for the reason everything else in this view is: a panel has to be able to
+	-- ask how much of its denominator is arithmetic, and it cannot ask that of a projection that
+	-- dropped the flag.
+	runner_prompt_n_includes_cache,
+	prompt_tokens_derived
 FROM call_events;
 
 -- ─── call_quality: the store's own trustworthiness, as data ────────────────────────────
@@ -612,7 +659,22 @@ SELECT
 	-- observer recorded content before it recorded the first byte, which is a contradiction rather than
 	-- a fast model - counted here rather than CHECK-rejected, because the alternative is dropping the
 	-- call and the measurement with it.
-	count(*) FILTER (WHERE first_content_gap_ms < 0) AS calls_with_negative_first_content_gap
+	count(*) FILTER (WHERE first_content_gap_ms < 0) AS calls_with_negative_first_content_gap,
+	-- The provenance of the prompt numbers, per backend. This is a population question, not a mean:
+	-- `prompt_tokens_computed` means "the runner's own number" on one engine and "the router's
+	-- subtraction" on another, and a panel that averages the two is describing neither. The unknowns
+	-- are counted apart from the NOs, because a surface that has not said yet is not a surface that
+	-- said no.
+	count(*) FILTER (WHERE runner_prompt_n_includes_cache is not null) AS calls_with_prompt_n_flag,
+	count(*) FILTER (WHERE runner_prompt_n_includes_cache) AS calls_with_prompt_n_including_cache,
+	count(*) FILTER (WHERE prompt_tokens_derived is not null) AS calls_with_prompt_derivation_flag,
+	count(*) FILTER (WHERE prompt_tokens_derived) AS calls_with_derived_prompt_tokens,
+	-- The equality that looks like corroboration and is not: cached + computed == prompt holds on
+	-- every live row, both where the engine reported it and where the router built it. Published so
+	-- nobody uses that agreement as evidence without the two flags next to it.
+	count(*) FILTER (WHERE prompt_tokens_computed is not null and prompt_tokens is not null
+					AND prompt_tokens_computed = prompt_tokens - coalesce(cached_tokens, 0))
+											AS calls_where_prompt_equals_cached_plus_computed
 FROM call_events
 GROUP BY backend;
 
