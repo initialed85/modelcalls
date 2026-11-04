@@ -65,7 +65,12 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- How this row came to represent the call it represents:
 	--   self                 - the only source that saw it.
 	--   upstream_id          - joined to an existing row by the runner's chatcmpl id.
-	--   backend_key_window   - fallback join: same backend, same session key, nearest ts.
+	--   backend_key_window   - fallback join: same backend, exactly one side holding a session key,
+	--                          candidate with no upstream_id and source_count = 1, starts within the
+	--                          window (plus each side's wait_ms), and the two call intervals
+	--                          overlapping. Proximity is the discriminator: a long interval alone
+	--                          touches a lot of unrelated work, which is how a 125.6 s call absorbed
+	--                          a 4.7 s record two minutes later in a live run.
 	-- Recorded rather than inferred at query time, because the fallback join is the part of this
 	-- design that rests on an assumption, and a dashboard must be able to show how much of what
 	-- it displays depends on it.
@@ -177,15 +182,27 @@ CREATE TABLE IF NOT EXISTS call_events (
 	-- It is a token ratio and nothing else. Strata's own `hit_rate` is NOT this ratio - measured
 	-- live across its 12 retained requests, reused/prompt_tokens sits at 0.992-0.9996 while
 	-- hit_rate sits at 0.802-0.903, and not one of the twelve agrees within 0.02. Strata runs an
-	-- MoE expert cache (expert_slots, expert_cache_mib), which is the obvious candidate for what
-	-- its hit_rate actually counts, but it is not established, so it does not get a column: an
-	-- unknown metric promoted to a first-class column becomes a dashboard legend that lies. It is
-	-- preserved verbatim in `extra` under the runner's own name until the meaning is known.
+	-- MoE expert cache (expert_slots, expert_cache_mib), which was the obvious candidate for what
+	-- its hit_rate counts - and the runner now says so in its own words (serve/prometheus.py: "The
+	-- last request's expert cache hit rate"), so it is a named column rather than a mystery living
+	-- in `extra`. An unexplained number promoted to a first-class column becomes a dashboard legend
+	-- that lies; an explained one gets a name that stops the next reader conflating it.
+	--
+	-- Three rates, three different questions, no shared column:
+	--   cache_hit_rate         cached_tokens / prompt_tokens  - what the runner BILLED as cached
+	--   engine_cache_hit_rate  engine_cached_tokens / prompt_tokens - what it internally REUSED
+	--   expert_cache_hit_rate  reported, not derived - how much MoE expert weight stayed resident
+	-- A 107k-token prompt can be ~99% reused and ~85% expert-resident at the same time, both true,
+	-- and a single "cache hit rate" column would make one of those sentences false.
 	--
 	-- The components stay in the row so a definition change is a recompute and not a migration.
 	prefill_tok_s double precision check (prefill_tok_s is null or prefill_tok_s >= 0),
 	decode_tok_s double precision check (decode_tok_s is null or decode_tok_s >= 0),
 	cache_hit_rate double precision check (cache_hit_rate is null or (cache_hit_rate >= 0 and cache_hit_rate <= 1)),
+	engine_cache_hit_rate double precision check (engine_cache_hit_rate is null or (engine_cache_hit_rate >= 0 and engine_cache_hit_rate <= 1)),
+	-- Recorded exactly as the runner reports it. Not a token ratio, never to be read as one, and
+	-- kept separate from the two ratios above for that reason.
+	expert_cache_hit_rate double precision check (expert_cache_hit_rate is null or (expert_cache_hit_rate >= 0 and expert_cache_hit_rate <= 1)),
 
 	-- usage_source names the MECHANISM that produced the numbers, not the component that happened
 	-- to use it. A vocabulary of components rots the moment a second component learns the same
@@ -261,6 +278,103 @@ CREATE INDEX IF NOT EXISTS call_events_ts ON call_events (ts desc);
 CREATE INDEX IF NOT EXISTS call_events_observed_ts ON call_events (last_seen_at desc);
 CREATE INDEX IF NOT EXISTS call_events_source_ids ON call_events USING gin (source_ids);
 
+-- ─── the cache rates are derived by the database, not by the writer ───────────────────
+--
+-- Two of the three rate columns are ratios of columns in the same row, so the row is the only
+-- place they can be defined consistently. If every probe computes its own, then "cache hit rate"
+-- means whatever each probe decided it meant - and the one mistake this table is most likely to
+-- inherit from Strata is feeding its expert-cache `hit_rate` (0.80-0.90) into a prompt-reuse column
+-- (0.99+) and never noticing, because both are between 0 and 1 and both are called a cache rate.
+--
+-- So the database derives them, refuses a rate it cannot source, and refuses a rate that disagrees
+-- with its own components. A BEFORE trigger is the only place this holds for every writer: the Go
+-- store, a psql session, a future importer, and `ON CONFLICT DO UPDATE`, where the merged components
+-- come from two different sightings and the rate has to be recomputed from the merge rather than
+-- carried over from whichever event last set it.
+--
+-- The tolerance is 1e-6 because the columns are double precision and a 6-decimal literal is not
+-- exactly representable. It is a statement about binary fractions, not a license to be approximate:
+-- the disagreement it would let through is 0.000001, and the disagreement it exists to catch is 0.15.
+CREATE OR REPLACE FUNCTION call_events_derive_rates() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+	wire_ratio numeric;
+	engine_ratio numeric;
+	-- A rate the writer did not touch is not a claim by the writer. On an UPDATE, NEW carries the
+	-- value the row already held, which was derived from the components the row USED to have - so
+	-- changing cached_tokens would otherwise be rejected for disagreeing with the stale rate it is
+	-- changing. Only a rate the statement actually altered can be checked against a claim.
+	claimed_wire boolean;
+	claimed_engine boolean;
+BEGIN
+	claimed_wire := (TG_OP = 'INSERT' AND NEW.cache_hit_rate IS NOT NULL)
+		OR (TG_OP = 'UPDATE' AND NEW.cache_hit_rate IS DISTINCT FROM OLD.cache_hit_rate);
+	claimed_engine := (TG_OP = 'INSERT' AND NEW.engine_cache_hit_rate IS NOT NULL)
+		OR (TG_OP = 'UPDATE' AND NEW.engine_cache_hit_rate IS DISTINCT FROM OLD.engine_cache_hit_rate);
+
+	IF NEW.prompt_tokens IS NOT NULL AND NEW.prompt_tokens > 0 THEN
+		IF NEW.cached_tokens IS NOT NULL THEN
+			wire_ratio := NEW.cached_tokens::numeric / NEW.prompt_tokens::numeric;
+			IF wire_ratio > 1 THEN
+				-- cached_tokens larger than prompt_tokens is not a rounding error, it is two surfaces
+				-- describing different calls agreeing by accident - the fallback join failing loudly.
+				RAISE EXCEPTION 'call_events: cached_tokens % exceeds prompt_tokens % on event_key % - two surfaces are describing different calls',
+					NEW.cached_tokens, NEW.prompt_tokens, NEW.event_key;
+			END IF;
+			IF claimed_wire AND abs(NEW.cache_hit_rate::numeric - wire_ratio) > 0.000001 THEN
+				RAISE EXCEPTION 'call_events: cache_hit_rate % does not match cached_tokens % / prompt_tokens % = % on event_key % (this is where Strata''s expert-cache hit_rate would land, and it is not a prompt-reuse rate)',
+					NEW.cache_hit_rate, NEW.cached_tokens, NEW.prompt_tokens, wire_ratio, NEW.event_key;
+			END IF;
+			NEW.cache_hit_rate := wire_ratio;
+		ELSIF NEW.cache_hit_rate IS NOT NULL THEN
+			IF claimed_wire THEN
+				RAISE EXCEPTION 'call_events: cache_hit_rate % on event_key % has no cached_tokens to derive it from - a rate with no numerator is a guess wearing a column',
+					NEW.cache_hit_rate, NEW.event_key;
+			END IF;
+			-- The numerator went away, so the rate goes with it rather than lingering as a number
+			-- that no longer describes anything in this row.
+			NEW.cache_hit_rate := NULL;
+		END IF;
+
+		IF NEW.engine_cached_tokens IS NOT NULL THEN
+			engine_ratio := NEW.engine_cached_tokens::numeric / NEW.prompt_tokens::numeric;
+			IF engine_ratio > 1 THEN
+				RAISE EXCEPTION 'call_events: engine_cached_tokens % exceeds prompt_tokens % on event_key % - two surfaces are describing different calls',
+					NEW.engine_cached_tokens, NEW.prompt_tokens, NEW.event_key;
+			END IF;
+			IF claimed_engine AND abs(NEW.engine_cache_hit_rate::numeric - engine_ratio) > 0.000001 THEN
+				RAISE EXCEPTION 'call_events: engine_cache_hit_rate % does not match engine_cached_tokens % / prompt_tokens % = % on event_key %',
+					NEW.engine_cache_hit_rate, NEW.engine_cached_tokens, NEW.prompt_tokens, engine_ratio, NEW.event_key;
+			END IF;
+			NEW.engine_cache_hit_rate := engine_ratio;
+		ELSIF NEW.engine_cache_hit_rate IS NOT NULL THEN
+			IF claimed_engine THEN
+				RAISE EXCEPTION 'call_events: engine_cache_hit_rate % on event_key % has no engine_cached_tokens to derive it from',
+					NEW.engine_cache_hit_rate, NEW.event_key;
+			END IF;
+			NEW.engine_cache_hit_rate := NULL;
+		END IF;
+	ELSE
+		-- No denominator. A rate claimed here is unsourced; a rate left over from before is stale
+		-- and is dropped rather than kept as decoration.
+		IF claimed_wire OR claimed_engine THEN
+			RAISE EXCEPTION 'call_events: a cache rate on event_key % with prompt_tokens % has no denominator',
+				NEW.event_key, NEW.prompt_tokens;
+		END IF;
+		NEW.cache_hit_rate := NULL;
+		NEW.engine_cache_hit_rate := NULL;
+	END IF;
+
+	-- expert_cache_hit_rate is deliberately NOT touched: it is a reported quantity from the
+	-- runner''s own accounting, it is not a ratio of anything in this row, and deriving it would
+	-- invent a measurement the runner never made.
+	RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS call_events_rates ON call_events;
+CREATE TRIGGER call_events_rates BEFORE INSERT OR UPDATE ON call_events
+	FOR EACH ROW EXECUTE FUNCTION call_events_derive_rates();
+
 -- ─── calls: the view dashboards should read ────────────────────────────────────────────
 --
 -- A thin, boring surface over the table with a stable call id. Reading the table directly is
@@ -294,6 +408,8 @@ SELECT
 	cached_tokens,
 	engine_cached_tokens,
 	cache_hit_rate,
+	engine_cache_hit_rate,
+	expert_cache_hit_rate,
 	prefill_tok_s,
 	decode_tok_s,
 	wait_ms,
@@ -321,12 +437,17 @@ SELECT
 	count(*) FILTER (WHERE source_count > 1) AS calls_joined_across_surfaces,
 	count(*) FILTER (WHERE upstream_id is not null) AS calls_with_upstream_id,
 	count(*) FILTER (WHERE join_method = 'backend_key_window') AS calls_joined_by_fallback,
+	-- How many rows carry the expert-cache rate at all. It is the axis most likely to be misread as
+	-- a prompt-cache rate, so its coverage belongs next to the two prompt-cache rates.
+	count(*) FILTER (WHERE expert_cache_hit_rate is not null) AS calls_with_expert_cache_rate,
 	-- The two measurements of the same concept. If these drift apart, one of them is not what you
-	-- think it is.
+	-- think it is. The third average is a DIFFERENT concept, listed beside them only so that its
+	-- distance from the other two stays visible instead of being quietly averaged with them.
 	avg(cache_hit_rate) FILTER (WHERE cache_hit_rate is not null) AS mean_wire_cache_rate,
 	avg(engine_cached_tokens::numeric / NULLIF(prompt_tokens, 0))
 		FILTER (WHERE engine_cached_tokens is not null and prompt_tokens is not null and prompt_tokens > 0)
-		AS mean_engine_cache_rate
+		AS mean_engine_cache_rate,
+	avg(expert_cache_hit_rate) FILTER (WHERE expert_cache_hit_rate is not null) AS mean_expert_cache_rate
 FROM call_events
 GROUP BY backend;
 

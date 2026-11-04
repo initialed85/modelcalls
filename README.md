@@ -36,9 +36,54 @@ The merge rule, applied everywhere:
 Path 3 exists for one specific hole. When a client abandons a stream, the runner's `chatcmpl` id
 lived in the part of the response that never arrived, so the router's row has no `upstream_id` and
 nothing can collide — and the engine that *did* finish the work has its own record. Without a
-fallback, one call becomes two rows. The predicate is deliberately narrow (same backend, same
-session key, timestamp within 2s, a row with no id and no usage yet) and it **refuses to guess**:
-two candidates stays two visibly unjoined rows.
+fallback, one call becomes two rows. The predicate is deliberately narrow:
+
+- same backend;
+- **exactly one side carries a session key**. A key is a witness that a client asked. Two rows that
+  both have one are two calls (or they would have joined on the runner's id); two rows that both
+  lack one are two engine records with nothing claiming they are the same work. Without this rule
+  two router envelopes in one session merge into each other, which fabricates a call rather than
+  joining one;
+- the candidate has no `upstream_id` and `source_count = 1`: a row that already holds two surfaces is
+  not a loose end, and pulling a third into it is how one wrong guess propagates into a row that
+  looks well attested;
+- **starts within 2 seconds**, with each side's `wait_ms` added to the allowance — the router arrives
+  before the engine does, and queueing is the legitimate part of a start-to-start difference. Both
+  surfaces in this system stamp the **start** of a call, which is now checked rather than assumed:
+  strata's record `time` sat 10 ms from a client's own request start on a call that then ran 11.4 s,
+  and rooter sets `ts` in `newCallRecord`, whose own comment is "everything here is known before a
+  slot is even requested". The invariant *`ts` is the start* is enforced in the probe, so a surface
+  that stamps the other end normalises it at translation time;
+- the two call intervals **also** overlap, as a secondary guard — and this guard earned its place the
+  hard way. An earlier revision tested overlap *instead of* proximity, and against live strata a
+  125.6 s envelope absorbed an unrelated 4.7 s engine record that began two minutes later. A long
+  interval touches a lot of work that is not yours, so the longer a call runs the more it would
+  swallow; the join reported itself as successful and was wrong. Proximity is what discriminates.
+
+And it **refuses to guess**: two candidates stays two visibly unjoined rows that `call_quality`
+reports as unjoined.
+
+## Who is allowed to create a call
+
+`cmd/mcharvest` polls the surfaces and writes. One rule in it is not cosmetic:
+
+- **rooter may insert.** Its record says a client asked, and a call with no engine numbers is still a
+  call.
+- **strata may not.** Its record is keyed by an internal id, has no session key, and cannot say a
+  client asked. It is written only when it joins a row that can (`RequireAttribution`). Everything
+  else is counted as `unattributed` and reported, not written.
+
+The reason is the whole point of the store: a completed call already has a rooter row, and if the
+engine's record of the same work is allowed to insert its own, the store counts one generation twice
+— once with a client and once without. That is not a gap in the data, it is invented data, and it is
+invisible in a total. Strata's per-request records stay available at `/metrics` for a reader who wants
+the engine's side of an unattributed call; they just do not become calls here.
+
+The permanent fix removes the guess entirely. Rooter's record already carries `upstream_id` (the
+chatcmpl id the runner generated) and `upstream_created`; strata's own record does not carry the
+chatcmpl id it minted, so the two cannot be joined on a key that means the same thing to both sides.
+Once strata exposes that id, this source sets `UpstreamID`, the join becomes path 2, and
+`unattributed` becomes the small number it should be: calls nobody routed.
 
 ## What the schema refuses to do
 
@@ -46,6 +91,14 @@ two candidates stays two visibly unjoined rows.
   no writer can disagree with it. Without it, "average tokens/sec this week" divides a denominator
   built from finished calls by a count that includes abandoned ones, and the answer is plausible
   enough to put on a dashboard.
+- **Rates are derived, not supplied.** `cache_hit_rate` is computed in a trigger from the row's own
+  components, because the two cache numbers people want are not the same number and are not close.
+  Measured on the same calls: strata's `hit_rate` is 0.802–0.903 (expert-attention cache: of the
+  tokens it reused, 80–90% came from the expert cache) while `cached_tokens / prompt_tokens` is
+  0.992–0.9996 (prompt reuse). Averaging the wrong one into a week is a lie that looks like a
+  saving. A rate that arrives with no named source is rejected outright; a rate that arrives with a
+  source must match the row's own components to 1e-6 or the insert fails; components move and the
+  derived rate follows silently.
 - **`ts_is_observation`** for surfaces with no clock. sushi's log lines carry no timestamp, so `ts`
   is when the probe read the line — and a graph that does not say that is a graph with invented
   precision. A real timestamp replaces an observed one, in both directions.

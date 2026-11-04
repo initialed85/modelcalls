@@ -7,11 +7,11 @@
 //
 // So the whole package is one question, asked in a fixed order: have I already seen this call?
 //
-//	1. same event_key                  -> this source is re-reporting. Merge, and do NOT count it
-//	                                      as a second witness.
-//	2. same upstream_id, other source  -> the join. Merge, and record the key that made it a join.
-//	3. narrow heuristic, one candidate -> merge, and name the method so it is auditable.
-//	4. none of the above               -> insert.
+//  1. same event_key                  -> this source is re-reporting. Merge, and do NOT count it
+//     as a second witness.
+//  2. same upstream_id, other source  -> the join. Merge, and record the key that made it a join.
+//  3. narrow heuristic, one candidate -> merge, and name the method so it is auditable.
+//  4. none of the above               -> insert.
 //
 // All four paths run through ONE SQL statement, because they all end up merging a fact-set into a
 // row that either exists or does not. The difference is only which event_key is named and whether
@@ -69,33 +69,40 @@ type Event struct {
 	// Sushi's log lines have no timestamp; pretending otherwise would put invented precision on a
 	// graph that people make decisions from.
 	TSIsObservation bool
+	// RequireAttribution refuses path 4. Set it for a surface that can describe the engine's work but
+	// cannot say a CLIENT asked for it - a runner's own metrics record, for example. Without this,
+	// every engine record that cannot be tied to a wire witness becomes its own row, and a store
+	// built to count calls ends up fabricating them: the same generation counted twice, one row with
+	// a client and one without. The event is then reported, not written, so the gap is visible in the
+	// harvester's counters instead of hiding in a call total.
+	RequireAttribution bool
 
 	// Backend is the runner family that answered. nil means the call never reached a backend - a
 	// 401 the router answered itself is an event with no backend.
-	Backend     *string
-	BackendURL  *string
-	Alias       *string
-	Profile     *string
-	Version     *string
-	Engine      *string
-	Model       *string
+	Backend        *string
+	BackendURL     *string
+	Alias          *string
+	Profile        *string
+	Version        *string
+	Engine         *string
+	Model          *string
 	ModelRequested *string
 
-	Kind     *string // gen | spill | rebind; nil is the normal case for a call
-	Key      *string // caller identity: token label or client name, never the token itself
+	Kind      *string // gen | spill | rebind; nil is the normal case for a call
+	Key       *string // caller identity: token label or client name, never the token itself
 	KeySource *string
-	Path     *string
-	Method   *string
-	Stream   *bool
-	Status   *int
-	Bytes    *int64
-	Aborted  *bool
+	Path      *string
+	Method    *string
+	Stream    *bool
+	Status    *int
+	Bytes     *int64
+	Aborted   *bool
 
 	Error map[string]any
 
-	WaitMs *float64
-	TTFTMs *float64
-	TotalMs *float64
+	WaitMs   *float64
+	TTFTMs   *float64
+	TotalMs  *float64
 	PromptMs *float64
 	DecodeMs *float64
 
@@ -104,9 +111,16 @@ type Event struct {
 	CachedTokens       *int64
 	EngineCachedTokens *int64
 
-	PrefillTokS  *float64
-	DecodeTokS   *float64
-	CacheHitRate *float64
+	PrefillTokS *float64
+	DecodeTokS  *float64
+
+	// There is deliberately no cache-rate field here. cache_hit_rate and engine_cache_hit_rate are
+	// derived by the database (call_events_derive_rates) from cached_tokens / prompt_tokens and
+	// engine_cached_tokens / prompt_tokens, on insert and again on every merge, and the trigger
+	// rejects a supplied rate that disagrees with its own components or has no numerator. A writer
+	// that could set them is a writer that could put Strata's expert-cache hit_rate (measured
+	// 0.802-0.903) into a prompt-reuse column (measured 0.992-0.9996) and never find out.
+	ExpertCacheHitRate *float64
 
 	UsageSource  string
 	FinishReason *string
@@ -114,13 +128,16 @@ type Event struct {
 	DraftsOffered  *int64
 	DraftsAccepted *int64
 
-	// Extra is what this source said, at its own top level: {"hit_rate": 0.802}, not
-	// {"strata": {"hit_rate": 0.802}}. The store namespaces it under Source on the way in, which
-	// is what keeps two surfaces describing one call from overwriting each other's evidence.
-	// Strata's hit_rate ends up at extra.strata.hit_rate, where it can be read without anyone
-	// having to guess which surface a number came from - and where it stays unexplained, because
-	// nobody has established what it counts and an unexplained number promoted to a column becomes
-	// a dashboard legend that lies.
+	// Extra is what this source said, at its own top level: {"raw": {...}}, not
+	// {"strata": {"raw": {...}}}. The store namespaces it under Source on the way in, which
+	// is what keeps two surfaces describing one call from overwriting each other's evidence -
+	// jsonb || merges at the top level only, so two surfaces both calling their payload "raw"
+	// would silently turn "who said this" into "who wrote last".
+	//
+	// Strata's full request record lands at extra.strata.raw. A quantity the runner reports that
+	// this schema has no honest column for stays there rather than being promoted into whichever
+	// column is nearest - which is exactly how an expert-cache rate would end up being read as a
+	// prompt-cache rate.
 	Extra map[string]any
 
 	// JoinMethod is set by the store, not the caller: self | upstream_id | backend_key_window.
@@ -138,10 +155,11 @@ type Result struct {
 }
 
 const (
-	PathRePull        = "re_pull"        // same event_key, merged
-	PathJoinUpstream  = "join_upstream"  // collided on the runner's id, merged
-	PathJoinFallback  = "join_fallback"  // merged by the narrow heuristic
-	PathInsert        = "insert"         // genuinely new
+	PathRePull       = "re_pull"       // same event_key, merged
+	PathJoinUpstream = "join_upstream" // collided on the runner's id, merged
+	PathJoinFallback = "join_fallback" // merged by the narrow heuristic
+	PathInsert       = "insert"        // genuinely new
+	PathUnattributed = "unattributed"  // RequireAttribution was set and nothing existing qualified
 )
 
 type Store struct {
@@ -243,7 +261,10 @@ func (s *Store) writeOnce(ctx context.Context, ev Event) (Result, error) {
 		return s.upsert(ctx, ev, candidate, joinOverride, PathJoinFallback)
 	}
 
-	// 4. New.
+	// 4. New - unless this surface is not allowed to invent a call.
+	if ev.RequireAttribution {
+		return Result{Path: PathUnattributed, EventKey: ev.EventKey}, nil
+	}
 	return s.upsert(ctx, ev, key, nil, PathInsert)
 }
 
@@ -261,7 +282,7 @@ INSERT INTO call_events (
 	kind, "key", key_source, path, method, stream, status, bytes, aborted, error,
 	wait_ms, ttft_ms, total_ms, prompt_ms, decode_ms,
 	prompt_tokens, completion_tokens, cached_tokens, engine_cached_tokens,
-	prefill_tok_s, decode_tok_s, cache_hit_rate,
+	prefill_tok_s, decode_tok_s, expert_cache_hit_rate,
 	usage_source, finish_reason, drafts_offered, drafts_accepted, extra, join_method
 ) VALUES (
 	$1, $2, $3, $4, $5, $6, $7,
@@ -307,7 +328,11 @@ ON CONFLICT (event_key) DO UPDATE SET
 	engine_cached_tokens = COALESCE(call_events.engine_cached_tokens, EXCLUDED.engine_cached_tokens),
 	prefill_tok_s        = COALESCE(call_events.prefill_tok_s, EXCLUDED.prefill_tok_s),
 	decode_tok_s         = COALESCE(call_events.decode_tok_s, EXCLUDED.decode_tok_s),
-	cache_hit_rate       = COALESCE(call_events.cache_hit_rate, EXCLUDED.cache_hit_rate),
+	-- No cache rate here, on purpose. The rates are derived from the merged components by the
+	-- call_events_rates trigger, which sees NEW after these COALESCEs have been applied. Carrying a
+	-- rate over from whichever sighting last set it is how a merged row ends up with a rate that
+	-- does not match the tokens sitting in the same row.
+	expert_cache_hit_rate = COALESCE(call_events.expert_cache_hit_rate, EXCLUDED.expert_cache_hit_rate),
 	finish_reason        = COALESCE(call_events.finish_reason, EXCLUDED.finish_reason),
 	drafts_offered       = COALESCE(call_events.drafts_offered, EXCLUDED.drafts_offered),
 	drafts_accepted      = COALESCE(call_events.drafts_accepted, EXCLUDED.drafts_accepted),
@@ -370,7 +395,7 @@ func (s *Store) upsert(ctx context.Context, ev Event, key string, joinOverride *
 		derefOpt(ev.Stream), derefOpt(ev.Status), derefOpt(ev.Bytes), boolOrDefault(ev.Aborted, false), errJSON,
 		derefOpt(ev.WaitMs), derefOpt(ev.TTFTMs), derefOpt(ev.TotalMs), derefOpt(ev.PromptMs), derefOpt(ev.DecodeMs),
 		derefOpt(ev.PromptTokens), derefOpt(ev.CompletionTokens), derefOpt(ev.CachedTokens), derefOpt(ev.EngineCachedTokens),
-		derefOpt(ev.PrefillTokS), derefOpt(ev.DecodeTokS), derefOpt(ev.CacheHitRate),
+		derefOpt(ev.PrefillTokS), derefOpt(ev.DecodeTokS), derefOpt(ev.ExpertCacheHitRate),
 		usageSourceOrDefault(ev.UsageSource), nullableString(ev.FinishReason), derefOpt(ev.DraftsOffered), derefOpt(ev.DraftsAccepted),
 		extra, nullableString(joinOverride),
 	)
@@ -437,31 +462,71 @@ func (s *Store) lookupUpstream(ctx context.Context, upstreamID string) (string, 
 // finished the work has its own record, and without a fallback the two surfaces produce two rows
 // for one call - which is not missing data, it is fabricated data.
 //
-// The predicate requires all of: same backend, same session key, a timestamp within
-// FallbackWindow, a row that has no upstream_id (so nothing better can be done), and a row that
-// has no usage yet (so the merge is filling a hole and not overwriting a measurement). And exactly
-// one candidate: two candidates is a coin flip, and a coin flip is not a join. Ambiguity is left
-// as two unjoined rows that call_quality then reports as unjoined, which is a visible weakness
-// rather than an invisible one.
+// The predicate requires all of:
+//   - same backend, and same session key where BOTH sides have one. A runner's own metrics record
+//     does not know who asked, so requiring its key to match would make this path unreachable in
+//     practice; allowing a NULL key on one side is the whole of the looseness here.
+//   - intervals overlap within FallbackWindow. NOT point proximity: measured against strata, a
+//     request record's `time` is the call's START (10 ms off the client's own start), while a
+//     router naturally stamps the call when the response ENDS. On an 11.4 s generation that is an
+//     11.5 s gap between two descriptions of one call, so a 2-second point window would never
+//     match - the fallback would sit there looking correct while joining nothing, forever.
+//   - source_count = 1: a row that already has two surfaces in it is not a loose end, and pulling
+//     a third into it is how one wrong guess propagates into a row that looks well attested.
+//   - upstream_id IS NULL: nothing better is available on that row.
+//   - exactly one wire witness between the two rows. A session key is a wire witness: it is a
+//     surface saying a client asked. Two rows that both have one are two calls (or they would have
+//     joined on the runner's id); two rows that both lack one are two engine records with nothing
+//     claiming they are the same work. The fallback exists to connect "a client asked" with "the
+//     engine did work", so that is exactly the pair it is allowed to merge - and without this rule,
+//     two router envelopes in one session merge into each other, which is a fabricated call.
+//   - exactly one candidate. Two candidates is a coin flip, and a coin flip is not a join.
+//     Ambiguity stays as two visibly unjoined rows that call_quality reports as unjoined.
+//
+// What this path cannot do is make a runner-side record trustworthy on its own. It is a rescue for
+// abandoned streams. The permanent fix is for the runner to expose the chatcmpl id it minted, which
+// turns this into path 2 and a key that can be shown to a reader.
 func (s *Store) lookupFallback(ctx context.Context, ev Event) (string, error) {
-	if deref(ev.Backend) == "" || deref(ev.Key) == "" {
+	if deref(ev.Backend) == "" {
 		return "", nil
 	}
-	// Only worth doing when this event brings something the envelope cannot produce.
+	// Only worth doing when this event brings something the row cannot produce on its own: an engine
+	// measurement, or a witness that a CLIENT caused this work (a session key plus a wire status).
+	// The second one matters more than it looks - without it, a runner-side record could never be told
+	// apart from engine-internal work, which is the difference between "a call happened" and
+	// "the engine did something".
 	if derefOpt(ev.PromptTokens) == nil && derefOpt(ev.CompletionTokens) == nil &&
-		derefOpt(ev.EngineCachedTokens) == nil && derefOpt(ev.DecodeTokS) == nil {
+		derefOpt(ev.EngineCachedTokens) == nil && derefOpt(ev.DecodeTokS) == nil &&
+		!(deref(ev.Key) != "" && derefOpt(ev.Status) != nil) {
 		return "", nil
 	}
 
+	// $3 is the incoming call's start, $4 its duration in ms (0 when unknown, which makes it a
+	// point), $5 is the overlap window in ms.
+	// The START distance does the discriminating work; the interval overlap is a secondary guard.
+	// Candidate is [ts, ts + total_ms]; the incoming event is ($3, $3 + $4); $5 is the window in ms;
+	// $6 is the incoming event's queue wait. A NULL duration makes an interval a point, which is what
+	// a surface that reports no duration actually is.
+	wait := 0.0
+	if ev.WaitMs != nil {
+		wait = *ev.WaitMs
+	}
 	const q = `
 		SELECT event_key FROM call_events
 		 WHERE backend = $1
-		   AND "key" = $2
+		   AND (($2::text IS NOT NULL AND "key" IS NULL) OR ($2::text IS NULL AND "key" IS NOT NULL))
 		   AND upstream_id IS NULL
-		   AND NOT has_usage
-		   AND abs(extract(epoch from ts) - extract(epoch from $3::timestamptz)) <= $4
+		   AND source_count = 1
+		   AND abs(extract(epoch from ts) - extract(epoch from $3::timestamptz))
+		       <= ($5 + coalesce(wait_ms, 0) + $6) / 1000.0
+		   AND ts + (coalesce(total_ms, 0)::double precision * interval '1 millisecond')
+		       >= $3::timestamptz - ($5::double precision * interval '1 millisecond')
+		   AND ts
+		       <= $3::timestamptz + (coalesce($4::double precision, 0) * interval '1 millisecond')
+		          + ($5::double precision * interval '1 millisecond')
 		 ORDER BY ts`
-	rows, err := s.db.QueryContext(ctx, q, *ev.Backend, *ev.Key, ev.TS, FallbackWindow.Seconds())
+	rows, err := s.db.QueryContext(ctx, q, *ev.Backend, nullableString(ev.Key), ev.TS,
+		derefOpt(ev.TotalMs), float64(FallbackWindow.Milliseconds()), wait)
 	if err != nil {
 		return "", fmt.Errorf("fallback lookup: %w", err)
 	}
@@ -569,5 +634,3 @@ func jsonOrEmpty(m map[string]any) (any, error) {
 	}
 	return string(b), nil
 }
-
-

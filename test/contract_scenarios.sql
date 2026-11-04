@@ -10,8 +10,10 @@
 --   1. same source, same native id        -> ON CONFLICT (event_key) merge. A re-pull.
 --   2. different source, same chatcmpl id -> collides on call_events_upstream_key; merge into the
 --                                           row that already holds that id. THIS is the join.
---   3. no collision, but a conservative candidate exists (same backend, same session key, ts
---      within 2s, exactly one candidate) -> merge into it, join_method = 'backend_key_window'.
+--   3. no collision, but a conservative candidate exists (same backend; exactly one side carries a
+--      session key; candidate has no upstream_id and source_count = 1; the two call intervals
+--      overlap within 2s; exactly one candidate) -> merge into it,
+--      join_method = 'backend_key_window'.
 --   4. none of the above                  -> insert a new row, join_method stays 'self'.
 --
 -- Order matters, and step 3 below is what the first draft of this file got wrong: if the router's
@@ -24,6 +26,18 @@
 \set ON_ERROR_STOP on
 
 BEGIN;
+
+-- These scenarios assert absolute counts, so they need an empty table. Re-running them against a
+-- database that already holds them reports a count that reads like a broken contract when nothing is
+-- broken - which is the kind of failure that sends someone to debug the wrong thing.
+DO $$
+DECLARE n bigint;
+BEGIN
+	SELECT count(*) INTO n FROM call_events;
+	IF n > 0 THEN
+		RAISE EXCEPTION 'contract_scenarios.sql needs an empty call_events: found % rows. Run it against a fresh database (or TRUNCATE call_events first).', n;
+	END IF;
+END $$;
 
 -- ══ A. a completed routed call, seen first by the router ════════════════════════════════════
 -- rooter parsed the response tail, so it has usage AND the runner's chatcmpl id. This is the good
@@ -72,13 +86,13 @@ BEGIN
 	INSERT INTO call_events (
 		event_key, source, source_ids, upstream_id, ts, backend, alias, profile, engine, model,
 		prompt_tokens, completion_tokens, cached_tokens, engine_cached_tokens, prompt_ms,
-		decode_ms, prefill_tok_s, decode_tok_s, cache_hit_rate, usage_source, finish_reason,
+		decode_ms, prefill_tok_s, decode_tok_s, expert_cache_hit_rate, usage_source, finish_reason,
 		drafts_offered, drafts_accepted, extra
 	) VALUES (
 		'strata|chatcmpl-aaa', 'strata', '{strata|chatcmpl-aaa}', 'chatcmpl-aaa',
 		'2026-11-04T09:00:01Z', 'strata', 'strata', 'iq3_xxs', '0.1.51',
 		'qwen3.8-flash-next-iq3_xxs', 106718, 700, 106677, 106677, 471.1, 9961.0, 2133.6,
-		70.3, 0.999616, 'runner_scrape', 'stop', 690, 431,
+		70.3, 0.802, 'runner_scrape', 'stop', 690, 431,
 		'{"raw": {"id": "b01b3fd29419", "hit_rate": 0.802, "reused": 106677, "drafts_offered": 690, "drafts_accepted": 431}}'::jsonb
 	);
 	RAISE EXCEPTION 'step C: WRONG - the insert succeeded, so a runner-side event created a second row for a call already in the store';
@@ -104,7 +118,7 @@ UPDATE call_events SET
 	decode_ms            = COALESCE(decode_ms, 9961.0),
 	prefill_tok_s        = COALESCE(prefill_tok_s, 2133.6),
 	decode_tok_s         = COALESCE(decode_tok_s, 70.3),
-	cache_hit_rate       = COALESCE(cache_hit_rate, 0.999616),
+	expert_cache_hit_rate = COALESCE(expert_cache_hit_rate, 0.802),
 	-- 'injected' is more informative than 'runner_scrape' and must survive the merge.
 	usage_source         = CASE WHEN usage_source IS NULL OR usage_source = 'none' THEN 'runner_scrape' ELSE usage_source END,
 	finish_reason        = COALESCE(finish_reason, 'stop'),
@@ -136,30 +150,54 @@ INSERT INTO call_events (
 
 -- ══ E. the same abandoned call, learned from the runner, with no key to collide on ══════════
 -- Strata did finish this generation and kept its own record of it, so the engine facts exist.
--- There is nothing to collide with: the router's row has upstream_id NULL. The fallback is a
--- lookup with a deliberately narrow predicate - same backend, same session key, ts within 2
--- seconds, and EXACTLY ONE candidate. Ambiguity is not resolved by guessing; it is left as two
--- rows with join_method 'self', which the quality view then reports as an unjoined pair.
+-- There is nothing to collide with: the router's row has upstream_id NULL, and strata's own record
+-- is keyed by its internal id, which no other surface has ever seen.
+--
+-- The predicate, and the history behind it. It tested "ts within 2 seconds", then "the two intervals
+-- overlap", and the second was wrong in a way only a live run showed: a 125.6 s envelope absorbed an
+-- unrelated 4.7 s engine record that began two minutes later, because a long interval touches a lot
+-- of work that is not yours. Both surfaces actually stamp the START of a call - strata's `time` was
+-- measured 10 ms from a client's own request start on a call that then ran 11.4 s, and rooter sets
+-- `ts` in newCallRecord, whose comment is "everything here is known before a slot is even
+-- requested" - so start-to-start proximity is the discriminating test, with wait_ms allowed for
+-- because the router arrives before the engine does. Overlap stays as a secondary guard.
+--
+-- Also required: same backend; exactly one side carries a session key (a wire witness - two rows that
+-- both have one are two calls, two that both lack one are two engine records); no upstream_id on the
+-- candidate; source_count = 1 (a row already holding two surfaces is not a loose end); and EXACTLY
+-- ONE candidate. Ambiguity is not resolved by guessing - it is left as two rows with join_method
+-- 'self', which the quality view then reports as an unjoined pair.
 DO $$
 DECLARE
 	candidate text;
 	n bigint;
+	-- The runner's own record of this call: start-stamped, no session key, 9599 ms of work.
+	incoming timestamptz := '2026-11-04T09:00:22Z';
+	incoming_ms double precision := 9599.2;
+	-- One wire witness only. $4 is the incoming event's session key: NULL here, because this is the
+	-- runner's own record and a runner does not know who asked. The mirrored arm (incoming has a key,
+	-- candidate has none) is the other arrival order, and the Go suite tests both directions.
+	sel text := '
+		SELECT event_key FROM call_events
+		 WHERE backend = ''strata''
+		   AND (($4::text IS NOT NULL AND "key" IS NULL) OR ($4::text IS NULL AND "key" IS NOT NULL))
+		   AND upstream_id IS NULL
+		   AND source_count = 1
+		   AND abs(extract(epoch from ts) - extract(epoch from $1))
+		       <= ($3 + coalesce(wait_ms, 0) + coalesce($5, 0)) / 1000.0
+		   AND ts + (coalesce(total_ms, 0) * interval ''1 millisecond'')
+		       >= $1 - ($3 * interval ''1 millisecond'')
+		   AND ts <= $1 + ($2 * interval ''1 millisecond'') + ($3 * interval ''1 millisecond'')
+		 ORDER BY ts';
 BEGIN
-	SELECT count(*) INTO n FROM call_events
-	 WHERE backend = 'strata'
-	   AND "key" = 'pi-code'
-	   AND upstream_id IS NULL
-	   AND NOT has_usage
-	   AND abs(extract(epoch from ts) - extract(epoch from timestamp with time zone '2026-11-04T09:00:22Z')) <= 2.0;
+	EXECUTE sel INTO candidate USING incoming, incoming_ms, 2000.0, NULL, 0.0;
+	IF candidate IS NULL THEN
+		n := 0;
+	ELSE
+		EXECUTE 'SELECT count(*) FROM (' || sel || ') x' USING incoming, incoming_ms, 2000.0, NULL, 0.0 INTO n;
+	END IF;
 
 	IF n = 1 THEN
-		SELECT event_key INTO candidate FROM call_events
-		 WHERE backend = 'strata'
-		   AND "key" = 'pi-code'
-		   AND upstream_id IS NULL
-		   AND NOT has_usage
-		   AND abs(extract(epoch from ts) - extract(epoch from timestamp with time zone '2026-11-04T09:00:22Z')) <= 2.0;
-
 		UPDATE call_events SET
 			-- The missing key arrives from the runner side. Recording it here is what makes the
 			-- next sighting of this call collide properly instead of falling back again.
@@ -264,6 +302,14 @@ BEGIN
 	IF r.drafts_accepted IS DISTINCT FROM 431 THEN RAISE EXCEPTION 'r-1001: speculative-decode facts not merged'; END IF;
 	IF r.has_usage IS DISTINCT FROM true THEN RAISE EXCEPTION 'r-1001: has_usage false while tokens exist'; END IF;
 	IF r.aborted IS DISTINCT FROM false THEN RAISE EXCEPTION 'r-1001: completed call marked aborted'; END IF;
+	-- The two prompt-cache rates are derived by the database from this row's own components (the
+	-- trigger recomputes them after a merge, which is why they are exact rather than the 0.999616
+	-- that step A supplied). The expert rate is stored exactly as the runner reported it. Both are
+	-- "a cache hit rate" in somebody's vocabulary, and they differ by 0.197 here.
+	IF round(r.cache_hit_rate::numeric, 6) IS DISTINCT FROM 0.999616 THEN RAISE EXCEPTION 'r-1001: cache_hit_rate % not derived from cached_tokens/prompt_tokens', r.cache_hit_rate; END IF;
+	IF round(r.engine_cache_hit_rate::numeric, 6) IS DISTINCT FROM 0.999616 THEN RAISE EXCEPTION 'r-1001: engine_cache_hit_rate % not derived from engine_cached_tokens/prompt_tokens', r.engine_cache_hit_rate; END IF;
+	IF r.expert_cache_hit_rate IS DISTINCT FROM 0.802 THEN RAISE EXCEPTION 'r-1001: expert_cache_hit_rate %, want 0.802 exactly as reported', r.expert_cache_hit_rate; END IF;
+	IF abs(r.cache_hit_rate - r.expert_cache_hit_rate) < 0.1 THEN RAISE EXCEPTION 'r-1001: prompt-reuse rate and expert-cache rate are within 0.1 of one another - one of them has been moved into the other column'; END IF;
 
 	SELECT count(*) INTO n FROM call_events WHERE event_key = 'strata|chatcmpl-aaa';
 	IF n <> 0 THEN RAISE EXCEPTION 'the runner-side sighting created its own row instead of merging'; END IF;
@@ -297,8 +343,7 @@ BEGIN
 	IF r.ts_is_observation IS DISTINCT FROM true THEN RAISE EXCEPTION 'sushi: observed-ts flag lost'; END IF;
 	IF r.version IS DISTINCT FROM 'sushi 1.1.1 (MLX 0.32.3)' THEN RAISE EXCEPTION 'sushi: version banner lost'; END IF;
 	IF r.source_count IS DISTINCT FROM 1 THEN RAISE EXCEPTION 'sushi: source_count %, want 1 (H is a re-pull, not a second surface)', r.source_count; END IF;
-	IF r.cache_hit_rate IS DISTINCT FROM 0.977806 THEN RAISE EXCEPTION 'sushi: cache_hit_rate %', r.cache_hit_rate; END IF;
-
+	IF round(r.cache_hit_rate::numeric, 6) IS DISTINCT FROM 0.977806 THEN RAISE EXCEPTION 'sushi: cache_hit_rate %, want 110674/113186 = 0.977806', r.cache_hit_rate; END IF;
 	-- The store's own shape. 5 calls: 2 joined across surfaces, 2 that no runner ever saw, 1
 	-- abandoned, 1 with an observed timestamp, 0 with a made-up backend.
 	SELECT count(*) INTO n FROM calls;
@@ -324,6 +369,7 @@ BEGIN
 	IF q.calls_aborted <> 1 THEN RAISE EXCEPTION 'strata aborted = %, want 1', q.calls_aborted; END IF;
 	IF q.calls_with_observed_ts <> 0 THEN RAISE EXCEPTION 'strata observed_ts = %, want 0', q.calls_with_observed_ts; END IF;
 	IF q.calls_without_usage <> 0 THEN RAISE EXCEPTION 'strata without_usage = %, want 0 (both learned usage)', q.calls_without_usage; END IF;
+	IF q.calls_with_expert_cache_rate <> 1 THEN RAISE EXCEPTION 'strata expert_cache coverage = %, want 1 (only r-1001 carries the runner''s expert rate)', q.calls_with_expert_cache_rate; END IF;
 
 	SELECT * INTO q FROM call_quality WHERE backend IS NULL;
 	IF q.calls <> 2 THEN RAISE EXCEPTION 'backendless quality = %, want 2', q.calls; END IF;
@@ -334,6 +380,80 @@ BEGIN
 	IF q.calls_with_observed_ts <> 1 THEN RAISE EXCEPTION 'sushi observed_ts = %, want 1', q.calls_with_observed_ts; END IF;
 
 	RAISE NOTICE 'contract holds: 5 calls, 2 joined across surfaces (1 by upstream_id, 1 by fallback), 1 abandoned stream counted at all, 2 unusable for aggregates, 1 observed timestamp flagged';
+END $$;
+
+-- ══ I. the cache rates cannot be supplied ═════════════════════════════════════════════
+-- The mistake this guard exists for is specific and plausible: Strata reports `hit_rate` between
+-- 0.802 and 0.903, it is the MoE expert cache's rate (its own serve/prometheus.py says so), and
+-- the same calls reuse 99.2-99.96% of their prompt. Both are 0-1, both get called a cache rate.
+-- A writer able to set cache_hit_rate will eventually set it to the wrong one, and the row will
+-- still look healthy.
+DO $$
+DECLARE
+	rejected boolean;
+BEGIN
+	-- Smuggling the expert rate into the prompt-reuse column: right shape, right range, wrong
+	-- quantity. Nothing about the row would reveal it afterwards.
+	rejected := false;
+	BEGIN
+		UPDATE call_events SET expert_cache_hit_rate = 0.848, cache_hit_rate = 0.848
+			WHERE event_key = 'rooter|r-1001';
+	EXCEPTION WHEN raise_exception THEN
+		rejected := true;
+	END;
+	IF NOT rejected THEN
+		RAISE EXCEPTION 'rates: an UPDATE that put the expert rate into cache_hit_rate was accepted';
+	END IF;
+
+	-- A rate whose numerator was removed by the same statement. This is a merge that fills a gap
+	-- with a number and never fills the components the number came from.
+	rejected := false;
+	BEGIN
+		UPDATE call_events SET cached_tokens = NULL, cache_hit_rate = 0.9 WHERE event_key = 'rooter|r-1001';
+	EXCEPTION WHEN raise_exception THEN
+		rejected := true;
+	END;
+	IF NOT rejected THEN
+		RAISE EXCEPTION 'rates: a cache_hit_rate with no cached_tokens was accepted';
+	END IF;
+
+	-- More cached than prompt: two surfaces describing different calls, agreeing by accident. This
+	-- is the fallback join failing, and it must be loud.
+	rejected := false;
+	BEGIN
+		UPDATE call_events SET cached_tokens = 120000 WHERE event_key = 'rooter|r-1001';
+	EXCEPTION WHEN raise_exception THEN
+		rejected := true;
+	END;
+	IF NOT rejected THEN
+		RAISE EXCEPTION 'rates: cached_tokens exceeding prompt_tokens was accepted';
+	END IF;
+
+	-- No denominator, so nothing in the row supports a rate.
+	rejected := false;
+	BEGIN
+		UPDATE call_events SET prompt_tokens = NULL, cache_hit_rate = 0.5 WHERE event_key = 'rooter|r-1001';
+	EXCEPTION WHEN raise_exception THEN
+		rejected := true;
+	END;
+	IF NOT rejected THEN
+		RAISE EXCEPTION 'rates: a cache_hit_rate with no prompt_tokens was accepted';
+	END IF;
+
+	-- Positive control: change the numerator and the stored rate moves on its own, while the engine
+	-- rate stays put because its own component did not change. The derivation follows the
+	-- components, and the two rates stay separate measurements.
+	UPDATE call_events SET cached_tokens = 100000 WHERE event_key = 'rooter|r-1001';
+	IF round((SELECT cache_hit_rate FROM call_events WHERE event_key = 'rooter|r-1001')::numeric, 6)
+		IS DISTINCT FROM round(100000.0 / 106718.0, 6) THEN
+		RAISE EXCEPTION 'rates: cache_hit_rate did not follow cached_tokens';
+	END IF;
+	IF round((SELECT engine_cache_hit_rate FROM call_events WHERE event_key = 'rooter|r-1001')::numeric, 6)
+		IS DISTINCT FROM 0.999616 THEN
+		RAISE EXCEPTION 'rates: engine_cache_hit_rate moved when only cached_tokens changed';
+	END IF;
+
+	RAISE NOTICE 'rates: expert rate cannot be smuggled into a prompt-reuse column, an unsourced rate is rejected, a rate follows its own components';
 END $$;
 
 ROLLBACK;

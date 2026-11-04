@@ -3,8 +3,10 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,29 +26,31 @@ import (
 //	  go test ./internal/store/
 
 type Row struct {
-	EventKey      sql.NullString
-	Source        sql.NullString
-	ID            sql.NullString
-	UpstreamID    sql.NullString
-	Backend       sql.NullString
-	Key           sql.NullString
-	Model         sql.NullString
-	Engine        sql.NullString
-	JoinMethod    sql.NullString
-	UsageSource   sql.NullString
-	FinishReason  sql.NullString
-	Aborted       bool
-	HasUsage      bool
-	TSIsObs       bool
-	SourceCount   int
-	TS            time.Time
-	TTFTMs        sql.NullFloat64
-	DecodeTokS    sql.NullFloat64
-	CacheHitRate  sql.NullFloat64
-	Bytes         sql.NullInt64
-	PromptTokens  sql.NullInt64
-	CompletedTok  sql.NullInt64
-	DraftsOk      sql.NullInt64
+	EventKey       sql.NullString
+	Source         sql.NullString
+	ID             sql.NullString
+	UpstreamID     sql.NullString
+	Backend        sql.NullString
+	Key            sql.NullString
+	Model          sql.NullString
+	Engine         sql.NullString
+	JoinMethod     sql.NullString
+	UsageSource    sql.NullString
+	FinishReason   sql.NullString
+	Aborted        bool
+	HasUsage       bool
+	TSIsObs        bool
+	SourceCount    int
+	TS             time.Time
+	TTFTMs         sql.NullFloat64
+	DecodeTokS     sql.NullFloat64
+	CacheHitRate   sql.NullFloat64
+	EngineRate     sql.NullFloat64
+	ExpertRate     sql.NullFloat64
+	Bytes          sql.NullInt64
+	PromptTokens   sql.NullInt64
+	CompletedTok   sql.NullInt64
+	DraftsOk       sql.NullInt64
 	ExtraHasStrata bool
 }
 
@@ -57,14 +61,15 @@ func fetch(t *testing.T, st *store.Store, eventKey string) Row {
 		SELECT event_key, source, id, upstream_id, backend, "key", model, engine,
 		       join_method, usage_source, finish_reason,
 		       aborted, has_usage, ts_is_observation, source_count, ts,
-		       ttft_ms, decode_tok_s, cache_hit_rate, bytes,
+		       ttft_ms, decode_tok_s, cache_hit_rate, engine_cache_hit_rate,
+		       expert_cache_hit_rate, bytes,
 		       prompt_tokens, completion_tokens, drafts_accepted,
 		       extra ? 'strata'
 		  FROM call_events WHERE event_key = $1`, eventKey).
 		Scan(&r.EventKey, &r.Source, &r.ID, &r.UpstreamID, &r.Backend, &r.Key, &r.Model, &r.Engine,
 			&r.JoinMethod, &r.UsageSource, &r.FinishReason,
 			&r.Aborted, &r.HasUsage, &r.TSIsObs, &r.SourceCount, &r.TS,
-			&r.TTFTMs, &r.DecodeTokS, &r.CacheHitRate, &r.Bytes,
+			&r.TTFTMs, &r.DecodeTokS, &r.CacheHitRate, &r.EngineRate, &r.ExpertRate, &r.Bytes,
 			&r.PromptTokens, &r.CompletedTok, &r.DraftsOk, &r.ExtraHasStrata)
 	if err == sql.ErrNoRows {
 		t.Fatalf("no row for event_key %q", eventKey)
@@ -84,11 +89,11 @@ func count(t *testing.T, st *store.Store, where string, args ...any) int {
 	return n
 }
 
-func str(s string) *string { return &s }
+func str(s string) *string   { return &s }
 func f64(v float64) *float64 { return &v }
-func i64(v int64) *int64 { return &v }
-func ival(v int) *int { return &v }
-func bval(v bool) *bool { return &v }
+func i64(v int64) *int64     { return &v }
+func ival(v int) *int        { return &v }
+func bval(v bool) *bool      { return &v }
 
 func setup(t *testing.T) (context.Context, *store.Store) {
 	t.Helper()
@@ -137,7 +142,6 @@ func TestContract(t *testing.T) {
 			Status: ival(200), Bytes: i64(98213), Aborted: bval(false),
 			WaitMs: f64(3.2), TTFTMs: f64(640.0), TotalMs: f64(10442.4),
 			PromptTokens: i64(106718), CompletionTokens: i64(700), CachedTokens: i64(106677),
-			CacheHitRate: f64(0.999616),
 			UsageSource:  store.UsageInjected,
 			FinishReason: str("stop"),
 			Extra:        map[string]any{"raw": map[string]any{"usage": map[string]any{"prompt_tokens": 106718}}},
@@ -195,14 +199,15 @@ func TestContract(t *testing.T) {
 			ID: str("chatcmpl-aaa"), UpstreamID: str("chatcmpl-aaa"), TS: base.Add(time.Second),
 			Backend: str("strata"), Alias: str("strata"), Profile: str("iq3_xxs"),
 			Engine: str("0.1.51"), Model: str("qwen3.8-flash-next-iq3_xxs"),
-			Key: str("pi-code"),
+			Key:          str("pi-code"),
 			PromptTokens: i64(106718), CompletionTokens: i64(700),
 			CachedTokens: i64(106677), EngineCachedTokens: i64(106677),
 			PromptMs: f64(471.1), DecodeMs: f64(9961.0),
-			PrefillTokS: f64(2133.6), DecodeTokS: f64(70.3), CacheHitRate: f64(0.999616),
-			UsageSource:  store.UsageRunnerScrape,
-			FinishReason: str("stop"),
-			DraftsOffered: i64(690), DraftsAccepted: i64(431),
+			PrefillTokS: f64(2133.6), DecodeTokS: f64(70.3),
+			ExpertCacheHitRate: f64(0.802),
+			UsageSource:        store.UsageRunnerScrape,
+			FinishReason:       str("stop"),
+			DraftsOffered:      i64(690), DraftsAccepted: i64(431),
 			Extra: map[string]any{"raw": map[string]any{"id": "b01b3fd29419", "hit_rate": 0.802}},
 		})
 		if err != nil {
@@ -286,8 +291,10 @@ func TestContract(t *testing.T) {
 		res, err := st.Write(ctx, store.Event{
 			EventKey: "strata|chatcmpl-bbb", Source: "strata", SourceIDs: []string{"strata|chatcmpl-bbb"},
 			ID: str("chatcmpl-bbb"), UpstreamID: str("chatcmpl-bbb"), TS: base.Add(22 * time.Second),
-			Backend: str("strata"), Alias: str("strata"), Profile: str("iq3_xxs"), Engine: str("0.1.51"),
-			Key: str("pi-code"),
+			// No Key on purpose: strata's own metrics surface does not know which session asked, and
+			// that absence is what makes it the engine side of a fallback join.
+			Backend: str("strata"),
+			Alias:   str("strata"), Profile: str("iq3_xxs"), Engine: str("0.1.51"),
 			PromptTokens: i64(103623), CompletionTokens: i64(640),
 			CachedTokens: i64(103582), EngineCachedTokens: i64(103582),
 			PromptMs: f64(498.9), DecodeMs: f64(9100.3), DecodeTokS: f64(70.3),
@@ -362,11 +369,11 @@ func TestContract(t *testing.T) {
 			TS: base.Add(40 * time.Second), TSIsObservation: true,
 			Backend: str("sushi"), BackendURL: str("http://192.168.137.111:8088"),
 			Alias: str("sushi"), Profile: str("2.6bpw"), Version: str("sushi 1.1.1 (MLX 0.32.3)"),
-			Model: str("Qwen3-Next-80B-A3B-Instruct-2.6bpw"),
+			Model:  str("Qwen3-Next-80B-A3B-Instruct-2.6bpw"),
 			Stream: bval(true), Status: ival(200), Aborted: bval(false),
 			PromptTokens: i64(113186), CompletionTokens: i64(217), CachedTokens: i64(110674),
 			PromptMs: f64(6804.7), DecodeMs: f64(4617.0),
-			PrefillTokS: f64(369.2), DecodeTokS: f64(47.0), CacheHitRate: f64(0.977806),
+			PrefillTokS: f64(369.2), DecodeTokS: f64(47.0),
 			UsageSource:  store.UsageRunnerScrape,
 			FinishReason: str("stop"),
 			Extra:        map[string]any{"raw": map[string]any{"line": "113186+217 tokens streamed"}},
@@ -404,7 +411,7 @@ func TestContract(t *testing.T) {
 		res, err := st.Write(ctx, store.Event{
 			EventKey: "strata|chatcmpl-ccc", Source: "strata", SourceIDs: []string{"strata|chatcmpl-ccc"},
 			UpstreamID: str("chatcmpl-ccc"), TS: base.Add(301 * time.Second),
-			Backend: str("strata"), Key: str("pi-code"),
+			Backend:      str("strata"), // no Key: this is the engine's record, not a wire witness
 			PromptTokens: i64(1000), CompletionTokens: i64(50), EngineCachedTokens: i64(900),
 			DecodeTokS: f64(60.0), UsageSource: store.UsageRunnerScrape,
 		})
@@ -447,7 +454,7 @@ func TestContract(t *testing.T) {
 		if _, err := st.Write(ctx, store.Event{
 			EventKey: "strata|chatcmpl-ddd", Source: "strata", SourceIDs: []string{"strata|chatcmpl-ddd"},
 			UpstreamID: str("chatcmpl-ddd"), TS: real,
-			Backend: str("sushi"), Key: str("pi-code"),
+			Backend:      str("sushi"), // no Key: engine-side sighting again
 			PromptTokens: i64(2000), CompletionTokens: i64(120), EngineCachedTokens: i64(1800),
 			DecodeTokS: f64(50.0), UsageSource: store.UsageRunnerScrape,
 		}); err != nil {
@@ -529,4 +536,231 @@ func TestValidateRejectsUnusableEvents(t *testing.T) {
 			t.Errorf("%s: write accepted an event with no %s", c.name, c.want)
 		}
 	}
+}
+
+// TestCacheRatesAreDerivedNotSupplied is the guard against the one mistake this schema is most
+// likely to inherit from Strata.
+//
+// Strata reports `hit_rate` on every request record, measured live between 0.802 and 0.903, and it
+// is the MoE expert cache's hit rate (its own serve/prometheus.py says "The last request's expert
+// cache hit rate"). The same requests reuse 99.2-99.96% of their prompt tokens. Both numbers are
+// between 0 and 1, both are called a cache rate by somebody, and a writer that can put either one
+// into cache_hit_rate will eventually put the wrong one there - because the row would still look
+// fine. So the rates are computed by the database from the row's own components, and a supplied
+// rate that disagrees is an error rather than a value.
+func TestCacheRatesAreDerivedNotSupplied(t *testing.T) {
+	ctx, st := setup(t)
+
+	// One call, components from two different surfaces: the wire billed 106895 cached, the engine
+	// internally reused 106895, and the expert cache hit 84.8%.
+	if _, err := st.Write(ctx, store.Event{
+		EventKey: "rooter|r-3001", Source: "rooter", SourceIDs: []string{"rooter|r-3001"},
+		UpstreamID: str("chatcmpl-3001"), TS: time.Now().UTC(),
+		Backend: str("strata"), Key: str("pi-code"),
+		PromptTokens: i64(107753), CompletionTokens: i64(662),
+		CachedTokens: i64(106895), EngineCachedTokens: i64(106895),
+		ExpertCacheHitRate: f64(0.848),
+		UsageSource:        store.UsageInjected,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	r := fetch(t, st, "rooter|r-3001")
+
+	// Derived, from this row's own numbers: 106895 / 107753.
+	want := 106895.0 / 107753.0
+	if !r.CacheHitRate.Valid || math.Abs(r.CacheHitRate.Float64-want) > 1e-9 {
+		t.Errorf("cache_hit_rate = %v, want %v derived from cached_tokens/prompt_tokens", r.CacheHitRate, want)
+	}
+	if !r.EngineRate.Valid || math.Abs(r.EngineRate.Float64-want) > 1e-9 {
+		t.Errorf("engine_cache_hit_rate = %v, want %v derived from engine_cached_tokens/prompt_tokens", r.EngineRate, want)
+	}
+
+	// The expert rate survives as reported, and it is measurably not the other two. If a future
+	// change ever makes them agree, this assertion is where the conflation gets noticed.
+	if !r.ExpertRate.Valid || math.Abs(r.ExpertRate.Float64-0.848) > 1e-9 {
+		t.Errorf("expert_cache_hit_rate = %v, want 0.848 as reported", r.ExpertRate)
+	}
+	if diff := math.Abs(r.CacheHitRate.Float64 - r.ExpertRate.Float64); diff < 0.1 {
+		t.Errorf("prompt-reuse rate and expert-cache rate differ by only %v - these are different quantities and one of them has been moved", diff)
+	}
+
+	// The rejections. Each one is a write that a plausible harvester could actually do.
+	cases := []struct {
+		name  string
+		set   string
+		wants string
+	}{
+		{
+			// Smuggling the expert rate into the prompt-reuse column: same row, right shape, wrong
+			// quantity. The row would otherwise look perfectly reasonable.
+			name:  "expert rate smuggled into cache_hit_rate",
+			set:   "cache_hit_rate = 0.848",
+			wants: "does not match",
+		},
+		{
+			// A rate with its numerator removed. The merge that does this is one that fills a gap
+			// with a number and never fills the components the number came from.
+			name:  "rate with no cached_tokens",
+			set:   "cached_tokens = NULL, cache_hit_rate = 0.9",
+			wants: "no cached_tokens",
+		},
+		{
+			// More cached than prompt: two surfaces describing different calls, agreeing by accident.
+			name:  "cached_tokens exceeds prompt_tokens",
+			set:   "cached_tokens = 120000",
+			wants: "exceeds prompt_tokens",
+		},
+		{
+			// The denominator is gone, so nothing in this row supports a rate.
+			name:  "rate with no denominator",
+			set:   "prompt_tokens = NULL, cache_hit_rate = 0.5",
+			wants: "no denominator",
+		},
+	}
+	for _, c := range cases {
+		_, err := st.DB().ExecContext(ctx, "UPDATE call_events SET "+c.set+" WHERE event_key = $1", "rooter|r-3001")
+		if err == nil {
+			t.Errorf("%s: accepted, want a rejection", c.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wants) {
+			t.Errorf("%s: error = %q, want it to explain %q", c.name, err.Error(), c.wants)
+		}
+	}
+
+	// Positive control: the derivation follows the components. Change the numerator and the stored
+	// rate moves, without anybody computing it.
+	if _, err := st.DB().ExecContext(ctx,
+		"UPDATE call_events SET cached_tokens = 100000 WHERE event_key = $1", "rooter|r-3001"); err != nil {
+		t.Fatalf("legitimate update rejected: %v", err)
+	}
+	r = fetch(t, st, "rooter|r-3001")
+	if want2 := 100000.0 / 107753.0; math.Abs(r.CacheHitRate.Float64-want2) > 1e-9 {
+		t.Errorf("cache_hit_rate = %v after changing cached_tokens, want %v", r.CacheHitRate, want2)
+	}
+	// The engine rate did not follow it: it is derived from engine_cached_tokens, which is a
+	// different measurement of a similar concept, and keeping them separate is the point of having
+	// both.
+	if math.Abs(r.EngineRate.Float64-want) > 1e-9 {
+		t.Errorf("engine_cache_hit_rate = %v, want it to stay %v (engine_cached_tokens did not change)", r.EngineRate, want)
+	}
+}
+
+// TestFallbackAttributionRestartsFromStartProximity is a correction, and a live run is what made it.
+//
+// The first version of the fallback joined on interval overlap, justified by a premise I had not
+// checked: that a router stamps a call when the response ends. It does not. rooter sets `ts` in
+// newCallRecord, whose own comment reads "everything here is known before a slot is even requested",
+// and strata's request-record `time` was measured 10 ms from a client's own request start on a call
+// that then ran 11.4 s. Both surfaces stamp the START of the call.
+//
+// Then the harvester ran against live strata. A 125.6 s envelope - stamped at its completion, because
+// that is what the premise said - drew an interval from 03:05:49 to 03:07:54 and absorbed an unrelated
+// 4.7 s engine record beginning at 03:07:53. That is the failure mode of "the intervals touch": the
+// longer a call runs, the more unrelated work it can swallow, so a busy long generation becomes a
+// magnet for other people's records. The join looked successful, and it was wrong.
+//
+// So: starts within a window, with queue wait allowed for (wait_ms is the legitimate part of a
+// start-to-start difference), and overlap demoted to a secondary guard. The invariant "ts is the start
+// of the call" is enforced in the probe, because that is where a surface's stamping habit is known.
+func TestFallbackAttributionRestartsFromStartProximity(t *testing.T) {
+	ctx, st := setup(t)
+	base := time.Now().UTC().Truncate(time.Microsecond).Add(-3600 * time.Second)
+
+	env := func(key string, ts time.Time, totalMs, waitMs float64, backend string) store.Event {
+		return store.Event{
+			EventKey: key, Source: "rooter", SourceIDs: []string{key}, TS: ts,
+			Backend: str(backend), Key: str("pi-code"), KeySource: str("header"),
+			Status: ival(200), Stream: bval(true), Aborted: bval(true), Bytes: i64(90000),
+			TotalMs: f64(totalMs), WaitMs: f64(waitMs), UsageSource: store.UsageNone,
+		}
+	}
+	engine := func(key string, ts time.Time, totalMs float64, prompt, out, reused int64, backend string) store.Event {
+		return store.Event{
+			EventKey: key, Source: "strata", SourceIDs: []string{key}, TS: ts, Backend: str(backend),
+			PromptTokens: i64(prompt), CompletionTokens: i64(out), EngineCachedTokens: i64(reused),
+			CachedTokens: i64(reused), TotalMs: f64(totalMs), DecodeTokS: f64(63.8),
+			UsageSource: store.UsageRunnerScrape, RequireAttribution: true,
+		}
+	}
+
+	t.Run("two_surfaces_that_both_stamp_the_start_join", func(t *testing.T) {
+		if _, err := st.Write(ctx, env("rooter|live-a", base, 125600, 3.0, "strata")); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|df04a0ed9165", base.Add(40*time.Millisecond),
+			125560, 41084, 9024, 40958, "strata"))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathJoinFallback {
+			t.Fatalf("path = %q, want join_fallback", res.Path)
+		}
+		r := fetch(t, st, "rooter|live-a")
+		if !r.HasUsage || r.PromptTokens.Int64 != 41084 {
+			t.Errorf("has_usage=%v prompt=%v: the engine numbers did not arrive", r.HasUsage, r.PromptTokens)
+		}
+		if !(r.CacheHitRate.Float64 > 0.99 && r.CacheHitRate.Float64 <= 1) {
+			t.Errorf("cache_hit_rate = %v, want the prompt-reuse ratio (40958/41084 = 0.9969)", r.CacheHitRate)
+		}
+	})
+
+	t.Run("a_long_call_does_not_absorb_an_unrelated_record_that_began_minutes_later", func(t *testing.T) {
+		// The live incident, as a regression.
+		if _, err := st.Write(ctx, env("rooter|live-b", base.Add(60*time.Second), 125600, 3.0, "sushi")); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|d3445f6c1b81", base.Add(184*time.Second),
+			4700, 56374, 279, 56337, "sushi"))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathUnattributed {
+			t.Fatalf("path = %q, want unattributed: 124 seconds apart is not the same call, however long the envelope is", res.Path)
+		}
+		if n := count(t, st, "event_key = 'strata|d3445f6c1b81'"); n != 0 {
+			t.Errorf("rows = %d, want 0: an engine record that cannot be attributed is reported, not written", n)
+		}
+		if r := fetch(t, st, "rooter|live-b"); r.HasUsage {
+			t.Error("has_usage true: the envelope picked up numbers from work it did not cause")
+		}
+	})
+
+	t.Run("queue_wait_is_a_legitimate_start_difference", func(t *testing.T) {
+		// A request that waited 8 s for a slot is described 8 s apart by the two surfaces, and that is
+		// not two calls. wait_ms is the size of the excuse, so it is part of the window rather than a
+		// reason to widen the window for everyone.
+		if _, err := st.Write(ctx, env("rooter|live-c", base.Add(400*time.Second), 30000, 8000.0, "queue")); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		res, err := st.Write(ctx, engine("strata|queued-1", base.Add(408*time.Second), 29000,
+			1000, 200, 900, "queue"))
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if res.Path != store.PathJoinFallback {
+			t.Fatalf("path = %q, want join_fallback: the engine began when a slot freed up, that is what wait_ms means", res.Path)
+		}
+	})
+
+	t.Run("the_engine_surface_arriving_first_joins_the_other_way_round", func(t *testing.T) {
+		res, err := st.Write(ctx, engine("strata|early-1", base.Add(700*time.Second), 20000,
+			2000, 400, 1800, "order"))
+		if err != nil {
+			t.Fatalf("write engine: %v", err)
+		}
+		if res.Path != store.PathUnattributed {
+			t.Fatalf("path = %q, want unattributed: nothing knows this call yet", res.Path)
+		}
+		// The engine's record is gone, and that is the correct outcome for a surface that cannot say a
+		// client asked. When rooter reports the same call later, the envelope is written on its own
+		// and the numbers stay where they can be seen: in the harvester's counters and in strata.
+		if _, err := st.Write(ctx, env("rooter|order-1", base.Add(700*time.Second), 20000, 2.0, "order")); err != nil {
+			t.Fatalf("write envelope: %v", err)
+		}
+		if n := count(t, st, "backend = 'order'"); n != 1 {
+			t.Errorf("rows = %d, want 1: the call rooter reported is one call, not two", n)
+		}
+	})
 }
